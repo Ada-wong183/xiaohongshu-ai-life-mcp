@@ -150,6 +150,8 @@ GEMINI_API_KEY=你的密钥
 | Stealth 注入 | `playwright-stealth` 消除 `webdriver` 等自动化特征 |
 | Shadow DOM | 通过拦截 `attachShadow` 访问 Web Component 内部，不依赖 `pierce` 选择器 |
 
+> **切换无头模式：** 如果在无显示器的服务器环境运行，可将 `xiaohongshu_mcp.py` 中两处 `headless=False` 改为 `headless=True`。无头模式更易被风控检测，建议仅在有头模式无法使用时才切换。
+
 ---
 
 ## 常见问题
