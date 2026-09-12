@@ -217,7 +217,7 @@ async def ensure_browser():
 
 @mcp.tool()
 async def login() -> str:
-    """登录小红书账号"""
+    """登录小红书账号。首次使用或 session 过期时调用，其他工具会自动检测登录状态，无需每次手动调用。"""
     global is_logged_in
     
     await ensure_browser()
@@ -267,13 +267,13 @@ async def login() -> str:
 
 @mcp.tool()
 async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) -> str:
-    """根据关键词搜索笔记。
+    """根据关键词搜索笔记。没有直链、只有关键词时使用。已有笔记链接时直接用 get_note_content，不要用搜索代替。
 
     Args:
         keywords: 搜索关键词
         limit: 返回结果数量限制（默认20，最多100）
         verbose: False（默认）只返回标题、作者、点赞、链接；
-                 True 额外返回笔记ID和xsecToken（需要对笔记做进一步操作时用）
+                 True 额外返回笔记ID和xsecToken（需要对该笔记点赞/收藏/查看作者时用）
     """
     login_status = await ensure_browser()
     if not login_status:
@@ -371,12 +371,13 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
 
 @mcp.tool()
 async def get_note_content(url: str, include_images: bool = True) -> str:
-    """获取笔记内容，自动处理配图。
+    """获取笔记正文和配图。有笔记链接时首选此工具，不要用 search_notes 代替。
+    支持完整链接（xiaohongshu.com/explore/...）和短链（xhslink.cn/...）。
 
     Args:
         url: 笔记 URL
         include_images: 是否处理配图（默认 True）。
-            ≤4张：下载到本地，返回路径供 AI 直接读取；
+            ≤4张：下载到本地，返回路径供 AI 直接读取图片内容；
             >4张：调用 Gemini 3.6 Flash 分析图片，返回文字描述。
     """
     login_status = await ensure_browser()
@@ -987,8 +988,8 @@ async def get_note_content(url: str, include_images: bool = True) -> str:
 
 @mcp.tool()
 async def get_note_comments(url: str) -> str:
-    """获取笔记评论
-    
+    """获取笔记评论列表。返回的 comment_id 可用于 reply_comment 和 like_comment。
+
     Args:
         url: 笔记 URL
     """
@@ -1624,8 +1625,8 @@ async def post_comment(url: str, comment: str) -> str:
 
 @mcp.tool()
 def get_note_images(url: str) -> dict:
-    """获取笔记图片，下载到本地并返回文件路径列表，供 AI 读取图片内容。
-    不需要登录，通过手机UA直接解析页面数据。
+    """仅获取笔记图片（不含正文）。通常不需要单独调用——get_note_content 已内置图片处理。
+    适用场景：只需要图片、不需要正文时。不需要登录，通过手机 UA 直接解析页面数据。
 
     Args:
         url: 笔记 URL（支持短链 xhslink.cn 和完整链接）
@@ -2103,7 +2104,7 @@ async def list_feeds(limit: int = 20, verbose: bool = False) -> str:
 
 @mcp.tool()
 async def get_my_notes(limit: int = 50) -> str:
-    """获取当前账号在创作者中心已发布的笔记列表。
+    """获取自己已发布的笔记列表。返回链接末段即为 note_id，可直接用于 delete_note。
 
     Args:
         limit: 最多返回条数，默认 50
@@ -2237,11 +2238,11 @@ async def _navigate_note(note_id: str, xsec_token: str = "") -> tuple:
 
 @mcp.tool()
 async def like_note(note_id: str, xsec_token: str = "", unlike: bool = False) -> str:
-    """点赞或取消点赞一篇笔记。
+    """点赞或取消点赞一篇笔记。note_id 和 xsec_token 从 search_notes(verbose=True) 或 list_feeds(verbose=True) 获取。
 
     Args:
-        note_id: 笔记 ID（从搜索结果获取）
-        xsec_token: 笔记的 xsec_token（从搜索结果获取，可留空）
+        note_id: 笔记 ID（从搜索结果或 feed 获取）
+        xsec_token: 笔记的 xsec_token（从搜索结果或 feed 获取，可留空）
         unlike: True 为取消点赞，默认 False（点赞）
     """
     page, err = await _navigate_note(note_id, xsec_token)
@@ -2284,11 +2285,11 @@ async def like_note(note_id: str, xsec_token: str = "", unlike: bool = False) ->
 
 @mcp.tool()
 async def favorite_note(note_id: str, xsec_token: str = "", unfavorite: bool = False) -> str:
-    """收藏或取消收藏一篇笔记。
+    """收藏或取消收藏一篇笔记。note_id 和 xsec_token 从 search_notes(verbose=True) 或 list_feeds(verbose=True) 获取。
 
     Args:
-        note_id: 笔记 ID
-        xsec_token: 笔记的 xsec_token
+        note_id: 笔记 ID（从搜索结果或 feed 获取）
+        xsec_token: 笔记的 xsec_token（从搜索结果或 feed 获取，可留空）
         unfavorite: True 为取消收藏，默认 False（收藏）
     """
     page, err = await _navigate_note(note_id, xsec_token)
