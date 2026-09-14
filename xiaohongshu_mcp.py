@@ -143,8 +143,10 @@ async def _quick_comments(page, limit: int = 15) -> str:
 mcp = FastMCP("xiaohongshu_scraper")
 
 # 全局变量
-BROWSER_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_data")
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+_DIR = os.path.dirname(os.path.abspath(__file__))
+BROWSER_DATA_DIR = os.path.join(_DIR, "browser_data")
+DATA_DIR = os.path.join(_DIR, "data")
+XHS_STATE_FILE = os.path.join(_DIR, "xhs_state.json")   # 登录 cookie 持久化文件
 XHS_MCP_DB = os.path.expanduser("~/.xhs-mcp/data.db")
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -223,16 +225,29 @@ async def ensure_browser():
     if browser_context is None:
         browser_instance = await async_playwright().start()
 
-        # 始终使用固定 Profile 目录的持久化上下文
-        # Chrome 自动在 BROWSER_DATA_DIR 里保存 cookie/登录态，关了再开状态还在
-        browser_context = await browser_instance.chromium.launch_persistent_context(
-            user_data_dir=BROWSER_DATA_DIR,
+        browser_obj = await browser_instance.chromium.launch(
             headless=False,
-            channel="chrome",      # 使用系统安装的真实 Chrome
-            viewport=None,         # 跟随窗口大小自适应
+            channel="chrome",
             args=['--no-sandbox', '--disable-setuid-sandbox'],
-            timeout=60000,
         )
+
+        # 从 xhs_state.json 加载已保存的 cookie
+        state = None
+        if os.path.exists(XHS_STATE_FILE):
+            try:
+                with open(XHS_STATE_FILE) as f:
+                    state = json.load(f)
+            except Exception:
+                state = None
+
+        browser_context = await browser_obj.new_context(
+            storage_state=state,   # None 时等同于空白 context
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            viewport=None,
+        )
+        if state:
+            is_logged_in = True
+
         # 注入 attachShadow 拦截器，使 closed shadow root 也可被访问
         await browser_context.add_init_script("""
             window.__shadowRoots = new WeakMap();
@@ -306,6 +321,13 @@ async def login() -> str:
             if not still_login:
                 is_logged_in = True
                 await _rand_sleep(2)  # 等待页面加载
+                # 保存 cookie 到 xhs_state.json，下次启动自动复用
+                try:
+                    state = await browser_context.storage_state()
+                    with open(XHS_STATE_FILE, 'w') as f:
+                        json.dump(state, f)
+                except Exception:
+                    pass
                 return "登录成功！"
             
             # 继续等待
