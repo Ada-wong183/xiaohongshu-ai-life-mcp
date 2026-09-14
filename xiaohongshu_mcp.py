@@ -86,6 +86,59 @@ async def _human_type(page, text: str, wpm: int = 180):
         else:
             await asyncio.sleep(_random.uniform(base_delay * 0.5, base_delay * 2.0))
 
+async def _quick_comments(page, limit: int = 15) -> str:
+    """从当前已加载的笔记页快速提取前 N 条评论，供 get_note_content 内联调用。"""
+    try:
+        # 先尝试从 __INITIAL_STATE__ 直接拿（最快）
+        data = await page.evaluate("""(limit) => {
+            const state = window.__INITIAL_STATE__;
+            const list = state?.comment?.comments
+                      || state?.commentModule?.commentList
+                      || [];
+            if (list.length > 0) {
+                return list.slice(0, limit).map(c => ({
+                    user: c.userInfo?.nickname || c.user?.nickname || '?',
+                    content: c.content || '',
+                    id: c.id || c.commentId || ''
+                }));
+            }
+            return null;
+        }""", limit)
+
+        if data:
+            lines = [f"{i+1}. {c['user']}: {c['content']}" for i, c in enumerate(data) if c['content']]
+            return "\n".join(lines)
+
+        # 降级：滚动一下再 DOM 抓
+        for _ in range(3):
+            await page.evaluate("window.scrollBy(0, 600)")
+            await asyncio.sleep(0.7)
+
+        items = await page.evaluate("""(limit) => {
+            const results = [];
+            const selectors = ['div.comment-item', 'div.commentItem', 'div.feed-comment'];
+            for (const sel of selectors) {
+                const els = [...document.querySelectorAll(sel)].slice(0, limit);
+                if (els.length > 0) {
+                    for (const el of els) {
+                        const user = el.querySelector('span.user-name,a.name,span.nickname')?.textContent?.trim() || '?';
+                        const content = el.querySelector('div.content,p.content,div.text')?.textContent?.trim()
+                                     || el.textContent?.trim() || '';
+                        if (content.length > 1) results.push(user + ': ' + content);
+                    }
+                    break;
+                }
+            }
+            return results;
+        }""", limit)
+
+        if items:
+            return "\n".join(f"{i+1}. {c}" for i, c in enumerate(items))
+        return ""
+    except Exception:
+        return ""
+
+
 # 初始化 FastMCP 服务器
 mcp = FastMCP("xiaohongshu_scraper")
 
@@ -152,8 +205,20 @@ def process_url(url: str) -> str:
     return processed_url
 
 async def ensure_browser():
-    """确保浏览器已启动并登录。优先用 xhs-mcp 的账号 state，没有则降级用持久化上下文"""
+    """确保浏览器已启动并登录。优先用 xhs-mcp 的账号 state，没有则降级用持久化上下文。
+    若浏览器进程已崩溃或被关闭，自动重置并重新启动，无需手动重启 MCP。"""
     global browser_instance, browser_obj, browser_context, main_page, is_logged_in
+
+    # 健康检查：browser_context 对象存在但浏览器进程实际已死时，自动重置
+    if browser_context is not None:
+        try:
+            await browser_context.pages()  # 若进程已死会抛异常
+        except Exception:
+            browser_instance = None
+            browser_obj = None
+            browser_context = None
+            main_page = None
+            is_logged_in = False
 
     if browser_context is None:
         browser_instance = await async_playwright().start()
@@ -371,8 +436,9 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
 
 @mcp.tool()
 async def get_note_content(url: str, include_images: bool = True) -> str:
-    """获取笔记正文和配图。有笔记链接时首选此工具，不要用 search_notes 代替。
+    """获取笔记正文、配图和前15条评论，一次调用返回完整内容。有笔记链接时首选此工具，不要用 search_notes 代替。
     支持完整链接（xiaohongshu.com/explore/...）和短链（xhslink.cn/...）。
+    如需获取更多评论，再单独调用 get_note_comments。
 
     Args:
         url: 笔记 URL
@@ -981,8 +1047,16 @@ async def get_note_content(url: str, include_images: bool = True) -> str:
             except Exception as e:
                 result += f"\n\n（图片处理出错：{e}）"
 
+        # ── 前15条评论（页面已加载，顺带抓，省一次调用）────────────
+        try:
+            comments_text = await _quick_comments(main_page, limit=15)
+            if comments_text:
+                result += f"\n\n💬 前15条评论：\n{comments_text}"
+        except Exception:
+            pass
+
         return result
-    
+
     except Exception as e:
         return f"获取笔记内容时出错: {str(e)}"
 
