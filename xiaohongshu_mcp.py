@@ -223,39 +223,26 @@ async def ensure_browser():
     if browser_context is None:
         browser_instance = await async_playwright().start()
 
-        state = load_xhs_state()
-        if state:
-            # 用 xhs-mcp 账号的 storage state 启动普通上下文
-            browser_obj = await browser_instance.chromium.launch(
-                headless=False,
-                channel="chrome",  # 用系统安装的真实 Chrome，更难被检测
-                args=['--no-sandbox', '--disable-setuid-sandbox']
-            )
-            browser_context = await browser_obj.new_context(
-                storage_state=state,
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                viewport=None  # 跟随窗口大小自适应，不强制固定分辨率
-            )
-            # 注入 attachShadow 拦截器，使 closed shadow root 也可被访问
-            await browser_context.add_init_script("""
-                window.__shadowRoots = new WeakMap();
-                const _orig = Element.prototype.attachShadow;
-                Element.prototype.attachShadow = function(init) {
-                    const shadow = _orig.call(this, init);
-                    window.__shadowRoots.set(this, shadow);
-                    return shadow;
-                };
-            """)
-            is_logged_in = True
-        else:
-            # fallback：用持久化上下文（需要手动登录）
-            browser_context = await browser_instance.chromium.launch_persistent_context(
-                user_data_dir=BROWSER_DATA_DIR,
-                headless=False,
-                channel="chrome",  # 用系统安装的真实 Chrome
-                viewport=None,     # 跟随窗口大小自适应
-                timeout=60000
-            )
+        # 始终使用固定 Profile 目录的持久化上下文
+        # Chrome 自动在 BROWSER_DATA_DIR 里保存 cookie/登录态，关了再开状态还在
+        browser_context = await browser_instance.chromium.launch_persistent_context(
+            user_data_dir=BROWSER_DATA_DIR,
+            headless=False,
+            channel="chrome",      # 使用系统安装的真实 Chrome
+            viewport=None,         # 跟随窗口大小自适应
+            args=['--no-sandbox', '--disable-setuid-sandbox'],
+            timeout=60000,
+        )
+        # 注入 attachShadow 拦截器，使 closed shadow root 也可被访问
+        await browser_context.add_init_script("""
+            window.__shadowRoots = new WeakMap();
+            const _orig = Element.prototype.attachShadow;
+            Element.prototype.attachShadow = function(init) {
+                const shadow = _orig.call(this, init);
+                window.__shadowRoots.set(this, shadow);
+                return shadow;
+            };
+        """)
 
         if browser_context.pages:
             main_page = browser_context.pages[0]
