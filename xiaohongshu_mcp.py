@@ -286,58 +286,44 @@ async def ensure_browser():
 async def login() -> str:
     """登录小红书账号。首次使用或 session 过期时调用，其他工具会自动检测登录状态，无需每次手动调用。"""
     global is_logged_in
-    
+
     await ensure_browser()
-    
-    if is_logged_in:
-        return "已登录小红书账号"
-    
-    # 访问小红书登录页面
-    if not main_page:  # 添加空检查
+
+    if not main_page:
         return "浏览器初始化失败，请重试"
-        
+
+    # 始终导航到首页验证实际登录状态（不信任内存里的 is_logged_in，cookie 可能已过期）
     await main_page.goto("https://www.xiaohongshu.com", timeout=60000)
     await _rand_sleep(3)
-    
-    # 查找登录按钮并点击
-    login_elements = await main_page.query_selector_all('text="登录"') if main_page else []  # 添加空检查
-    if login_elements:
-        await login_elements[0].click()
-        
-        # 提示用户手动登录
-        message = "请在打开的浏览器窗口中完成登录操作。登录成功后，系统将自动继续。"
-        
-        # 等待用户登录成功
-        max_wait_time = 180  # 等待3分钟
-        wait_interval = 5
-        waited_time = 0
-        
-        while waited_time < max_wait_time:
-            # 检查是否已登录成功
-            if not main_page:  # 添加空检查
-                return "浏览器初始化失败，请重试"
-                
-            still_login = await main_page.query_selector_all('text="登录"')
-            if not still_login:
-                is_logged_in = True
-                await _rand_sleep(2)  # 等待页面加载
-                # 保存 cookie 到 xhs_state.json，下次启动自动复用
-                try:
-                    state = await browser_context.storage_state()
-                    with open(XHS_STATE_FILE, 'w') as f:
-                        json.dump(state, f)
-                except Exception:
-                    pass
-                return "登录成功！"
-            
-            # 继续等待
-            await asyncio.sleep(wait_interval)
-            waited_time += wait_interval
-        
-        return "登录等待超时。请重试或手动登录后再使用其他功能。"
-    else:
+
+    # 查找登录按钮，不存在说明 cookie 有效、已经登录
+    login_elements = await main_page.query_selector_all('text="登录"')
+    if not login_elements:
         is_logged_in = True
         return "已登录小红书账号"
+
+    # 需要登录，等待用户在浏览器里扫码完成
+    max_wait_time = 180  # 最多等 3 分钟
+    wait_interval = 5
+    waited_time = 0
+
+    while waited_time < max_wait_time:
+        still_login = await main_page.query_selector_all('text="登录"')
+        if not still_login:
+            is_logged_in = True
+            await _rand_sleep(2)
+            # 保存 cookie，下次启动自动复用
+            try:
+                state = await browser_context.storage_state()
+                with open(XHS_STATE_FILE, 'w') as f:
+                    json.dump(state, f)
+            except Exception:
+                pass
+            return "登录成功！cookie 已保存，下次启动无需重新登录。"
+        await asyncio.sleep(wait_interval)
+        waited_time += wait_interval
+
+    return "登录等待超时，请重试。"
 
 @mcp.tool()
 async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) -> str:
