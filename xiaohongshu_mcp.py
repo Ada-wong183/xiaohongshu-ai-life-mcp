@@ -6,11 +6,11 @@ import re
 import base64
 import tempfile
 import sqlite3
+import time as _time
 import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
 from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
 from fastmcp import FastMCP
 import requests
 
@@ -68,6 +68,67 @@ def _analyze_images_with_gemini(image_paths: list, note_title: str = "") -> str:
 
 # ── 反风控辅助函数 ────────────────────────────────────────────────────
 import random as _random
+
+
+class _RateLimit:
+    """内存速率限制器，防止高频操作触发风控。"""
+    _limits = {
+        'comment': {'min_interval': 120, 'max_per_hour': 5},
+        'reply':   {'min_interval': 120, 'max_per_hour': 5},
+        'like':    {'min_interval': 30,  'max_per_hour': 20},
+        'search':  {'min_interval': 10,  'max_per_hour': 30},
+    }
+    _history: dict = {}
+
+    @classmethod
+    def check(cls, action_type: str):
+        """返回 None 表示允许，返回字符串表示拒绝原因（应直接 return 给调用方）。"""
+        cfg = cls._limits.get(action_type)
+        if not cfg:
+            return None
+        now = _time.time()
+        history = [t for t in cls._history.get(action_type, []) if now - t < 3600]
+        cls._history[action_type] = history
+        if history and (now - history[-1]) < cfg['min_interval']:
+            wait = int(cfg['min_interval'] - (now - history[-1]))
+            return f"⏳ 操作过于频繁，请等待约 {wait} 秒后再操作。（防风控：{action_type} 最短间隔 {cfg['min_interval']}s）"
+        if len(history) >= cfg['max_per_hour']:
+            wait = int(3600 - (now - history[0]))
+            return f"⏳ 本小时 {action_type} 次数已达上限（{cfg['max_per_hour']} 次），请等待约 {wait} 秒后再试。"
+        return None
+
+    @classmethod
+    def record(cls, action_type: str):
+        cls._history.setdefault(action_type, []).append(_time.time())
+
+
+async def _human_click(page, element=None, x: float = None, y: float = None):
+    """模拟人类鼠标轨迹后点击，降低自动化特征。元素不可见时降级为普通 click。"""
+    try:
+        if element is not None:
+            box = await element.bounding_box()
+            if box is None:
+                await element.click()
+                return
+            cx = box['x'] + box['width'] * _random.uniform(0.3, 0.7)
+            cy = box['y'] + box['height'] * _random.uniform(0.3, 0.7)
+        elif x is not None and y is not None:
+            cx, cy = float(x), float(y)
+        else:
+            return
+        # 先移到附近偏移点，再缓慢移到目标，模拟自然轨迹
+        await page.mouse.move(cx + _random.uniform(-40, 40), cy + _random.uniform(-20, 20))
+        await asyncio.sleep(_random.uniform(0.05, 0.15))
+        await page.mouse.move(cx, cy, steps=_random.randint(5, 12))
+        await asyncio.sleep(_random.uniform(0.05, 0.12))
+        await page.mouse.click(cx, cy)
+    except Exception:
+        if element is not None:
+            try:
+                await element.click()
+            except Exception:
+                pass
+
 
 async def _rand_sleep(base: float, jitter: float = 0.4):
     """带随机抖动的等待，模拟人类操作节奏。
@@ -203,7 +264,7 @@ async def _type_with_at_mention(page, text: str, avatar_map: dict | None = None)
                 await asyncio.sleep(0.5)
 
             if item_pos:
-                await page.mouse.click(item_pos['x'], item_pos['y'])
+                await _human_click(page, x=item_pos['x'], y=item_pos['y'])
                 await asyncio.sleep(0.8)
             else:
                 await page.keyboard.press('ArrowDown')
@@ -468,10 +529,6 @@ async def ensure_browser():
         else:
             main_page = await browser_context.new_page()
 
-        try:
-            await Stealth().apply_stealth_async(main_page)
-        except Exception:
-            pass
         main_page.set_default_timeout(60000)
 
     # 检查登录状态
@@ -538,6 +595,10 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
         verbose: False（默认）只返回标题、作者、点赞、链接；
                  True 额外返回笔记ID和xsecToken（需要对该笔记点赞/收藏/查看作者时用）
     """
+    _rl = _RateLimit.check('search')
+    if _rl:
+        return _rl
+
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号"
@@ -626,6 +687,7 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
                     f"{i}. 【{item['title'] or '无标题'}】  {item['author']}  ❤️{item['likes']}\n"
                     f"   {url}\n\n"
                 )
+        _RateLimit.record('search')
         return result
 
     except Exception as e:
@@ -657,7 +719,7 @@ async def get_note_content(url: str, include_images: bool = True) -> str:
         
         # 访问帖子链接，保留完整参数
         await main_page.goto(processed_url, timeout=60000)
-        await asyncio.sleep(10)  # 增加等待时间到10秒
+        await asyncio.sleep(_random.uniform(12, 18))
         
         # 检查是否加载了错误页面
         if not main_page:  # 添加空检查
@@ -1518,6 +1580,10 @@ async def post_comment(url: str, comment: str) -> str:
         url: 笔记 URL
         comment: 评论内容，支持 @昵称 或 @昵称:hexid 格式
     """
+    _rl = _RateLimit.check('comment')
+    if _rl:
+        return _rl
+
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号，才能发布评论"
@@ -1695,7 +1761,7 @@ async def post_comment(url: str, comment: str) -> str:
             return "未能找到评论输入框，无法发布评论"
         
         # 输入评论内容
-        await comment_input.click()
+        await _human_click(main_page, comment_input)
         await _rand_sleep(1)
         
         if not main_page:  # 添加空检查
@@ -1714,7 +1780,7 @@ async def post_comment(url: str, comment: str) -> str:
                 
             send_button = await main_page.query_selector('button:has-text("发送")')
             if send_button and await send_button.is_visible():
-                await send_button.click()
+                await _human_click(main_page, send_button)
                 await _rand_sleep(2)
                 send_success = True
         except Exception as e:
@@ -1757,6 +1823,7 @@ async def post_comment(url: str, comment: str) -> str:
         if send_success:
             if _note_id:
                 _record_comment('commented', _note_id, content=comment)
+            _RateLimit.record('comment')
             return f"{_history_prefix}已成功发布评论：{comment}"
         else:
             return f"发布评论失败，请检查评论内容或网络连接"
@@ -1921,7 +1988,6 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
 
         if notifications_page is None:
             notifications_page = await browser_context.new_page()
-            await Stealth().apply_stealth_async(notifications_page)
             notifications_page.set_default_timeout(30000)
 
         page = notifications_page
@@ -2018,6 +2084,10 @@ async def search_user(keyword: str) -> str:
     Args:
         keyword: 小红书号（如 1103700607）或用户昵称
     """
+    _rl = _RateLimit.check('search')
+    if _rl:
+        return _rl
+
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号"
@@ -2124,6 +2194,7 @@ async def search_user(keyword: str) -> str:
             lines.append(f"   主页：https://www.xiaohongshu.com/user/profile/{u['hex_id']}")
             lines.append("")
         lines.append("用 hex ID 调用 get_user_notes，token 已自动缓存。")
+        _RateLimit.record('search')
         return "\n".join(lines)
 
     except Exception as e:
@@ -2404,7 +2475,6 @@ async def get_my_notes(limit: int = 50) -> str:
 
     try:
         page = await browser_context.new_page()
-        await Stealth().apply_stealth_async(page)
         page.set_default_timeout(30000)
 
         # 监听 API 响应
@@ -2516,7 +2586,7 @@ async def _navigate_note(note_id: str, xsec_token: str = "") -> tuple:
         return None, "浏览器上下文未初始化"
 
     page = await browser_context.new_page()
-    await Stealth().apply_stealth_async(page)
+    await asyncio.sleep(_random.uniform(0.5, 1.5))
     page.set_default_timeout(30000)
 
     url = f"https://www.xiaohongshu.com/explore/{note_id}"
@@ -2546,6 +2616,10 @@ async def like_note(note_id: str, xsec_token: str = "", unlike: bool = False) ->
         xsec_token: 笔记的 xsec_token（从搜索结果或 feed 获取，可留空）
         unlike: True 为取消点赞，默认 False（点赞）
     """
+    _rl = _RateLimit.check('like')
+    if _rl:
+        return _rl
+
     page, err = await _navigate_note(note_id, xsec_token)
     if err:
         return err
@@ -2574,13 +2648,15 @@ async def like_note(note_id: str, xsec_token: str = "", unlike: bool = False) ->
         if not like_btn:
             return f"{action}失败：找不到点赞按钮"
 
-        await like_btn.click()
+        await _human_click(page, like_btn)
         await _rand_sleep(0.8)
+        _RateLimit.record('like')
         return f"✅ {action}成功（笔记 {note_id}）"
 
     except Exception as e:
         return f"{action if 'action' in dir() else '操作'}失败：{e}"
     finally:
+        await asyncio.sleep(_random.uniform(0.5, 1.2))
         await page.close()
 
 
@@ -2593,6 +2669,10 @@ async def favorite_note(note_id: str, xsec_token: str = "", unfavorite: bool = F
         xsec_token: 笔记的 xsec_token（从搜索结果或 feed 获取，可留空）
         unfavorite: True 为取消收藏，默认 False（收藏）
     """
+    _rl = _RateLimit.check('like')
+    if _rl:
+        return _rl
+
     page, err = await _navigate_note(note_id, xsec_token)
     if err:
         return err
@@ -2619,13 +2699,15 @@ async def favorite_note(note_id: str, xsec_token: str = "", unfavorite: bool = F
         if not collect_btn:
             return f"{action}失败：找不到收藏按钮"
 
-        await collect_btn.click()
+        await _human_click(page, collect_btn)
         await _rand_sleep(0.8)
+        _RateLimit.record('like')
         return f"✅ {action}成功（笔记 {note_id}）"
 
     except Exception as e:
         return f"{action if 'action' in dir() else '操作'}失败：{e}"
     finally:
+        await asyncio.sleep(_random.uniform(0.5, 1.2))
         await page.close()
 
 
@@ -2639,6 +2721,10 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
         content: 回复内容
         xsec_token: 笔记的 xsec_token
     """
+    _rl = _RateLimit.check('reply')
+    if _rl:
+        return _rl
+
     page, err = await _navigate_note(note_id, xsec_token)
     if err:
         return err
@@ -2678,7 +2764,7 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
         reply_btn = await comment_el.query_selector(".right .interactions .reply")
         if not reply_btn:
             return "找不到回复按钮"
-        await reply_btn.click()
+        await _human_click(page, reply_btn)
         await _rand_sleep(0.8)
 
         # 输入内容（直接 evaluate 设置 + 触发 input 事件，绕过 Vue 响应式）
@@ -2698,14 +2784,16 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
         submit_btn = await page.query_selector("div.bottom button.submit")
         if not submit_btn:
             return "找不到提交按钮"
-        await submit_btn.click()
+        await _human_click(page, submit_btn)
         await _rand_sleep(1.5)
         _record_comment('replied', note_id, comment_id=comment_id, content=content)
+        _RateLimit.record('reply')
         return f"{_reply_history_prefix}✅ 回复成功"
 
     except Exception as e:
         return f"回复失败：{e}"
     finally:
+        await asyncio.sleep(_random.uniform(0.5, 1.2))
         await page.close()
 
 
@@ -2745,6 +2833,10 @@ async def like_comment(note_id: str, comment_id: str, xsec_token: str = "", unli
         xsec_token: 笔记的 xsec_token
         unlike: True 为取消点赞
     """
+    _rl = _RateLimit.check('like')
+    if _rl:
+        return _rl
+
     page, err = await _navigate_note(note_id, xsec_token)
     if err:
         return err
@@ -2785,11 +2877,13 @@ async def like_comment(note_id: str, comment_id: str, xsec_token: str = "", unli
             el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
         }""")
         await _rand_sleep(0.8)
+        _RateLimit.record('like')
         return f"✅ {action}成功"
 
     except Exception as e:
         return f"{action if 'action' in dir() else '操作'}失败：{e}"
     finally:
+        await asyncio.sleep(_random.uniform(0.5, 1.2))
         await page.close()
 
 
@@ -2953,7 +3047,6 @@ async def delete_note(note_id: str) -> str:
     if not browser_context:
         return "浏览器上下文未初始化"
     page = await browser_context.new_page()
-    await Stealth().apply_stealth_async(page)
 
     try:
         await page.goto(
@@ -3097,7 +3190,6 @@ async def publish_note(
         mode = "upload" if valid_paths else "text_card"
 
     page = await browser_context.new_page()
-    await Stealth().apply_stealth_async(page)
     temp_img = None
 
     try:
