@@ -5,6 +5,7 @@ import os
 import re
 import base64
 import tempfile
+import sqlite3
 import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
@@ -274,12 +275,73 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 BROWSER_DATA_DIR = os.path.join(_DIR, "browser_data")
 DATA_DIR = os.path.join(_DIR, "data")
 XHS_MCP_DB = os.path.expanduser("~/.xhs-mcp/data.db")
+ACTIONS_DB = os.path.join(_DIR, "xhs_actions.db")
 CDP_PORT  = 9222
 CDP_URL   = f"http://localhost:{CDP_PORT}"
 
 # 确保目录存在
 os.makedirs(BROWSER_DATA_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def _init_actions_db():
+    try:
+        conn = sqlite3.connect(ACTIONS_DB)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS comment_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_type TEXT NOT NULL,
+                note_id TEXT NOT NULL,
+                comment_id TEXT DEFAULT '',
+                content TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_comment_note ON comment_history(note_id, action_type)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_comment_reply ON comment_history(comment_id, action_type)")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+_init_actions_db()
+
+
+def _record_comment(action_type: str, note_id: str, comment_id: str = '', content: str = ''):
+    try:
+        conn = sqlite3.connect(ACTIONS_DB)
+        conn.execute(
+            "INSERT INTO comment_history (action_type, note_id, comment_id, content, created_at) VALUES (?, ?, ?, ?, ?)",
+            (action_type, note_id, comment_id, content, datetime.now().isoformat(timespec='seconds'))
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _get_comment_history(note_id: str = '', action_type: str = None, comment_id: str = None) -> list:
+    try:
+        conn = sqlite3.connect(ACTIONS_DB)
+        conn.row_factory = sqlite3.Row
+        query = "SELECT action_type, note_id, comment_id, content, created_at FROM comment_history WHERE 1=1"
+        params = []
+        if note_id:
+            query += " AND note_id = ?"
+            params.append(note_id)
+        if action_type:
+            query += " AND action_type = ?"
+            params.append(action_type)
+        if comment_id:
+            query += " AND comment_id = ?"
+            params.append(comment_id)
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
 
 # 用于存储浏览器上下文，以便在不同方法之间共享
 browser_instance = None   # playwright 实例
@@ -1481,7 +1543,21 @@ async def post_comment(url: str, comment: str) -> str:
         # 处理URL
         processed_url = process_url(url)
         print(f"处理后的评论URL: {processed_url}")
-        
+
+        # 从 URL 提取 note_id（/explore/xxx?... → xxx）
+        _note_id_match = re.search(r'/explore/([^/?#]+)', processed_url)
+        _note_id = _note_id_match.group(1) if _note_id_match else ''
+
+        # 查历史，有则在结果前插入提示
+        _history_prefix = ''
+        if _note_id:
+            _prev = _get_comment_history(_note_id, action_type='commented')
+            if _prev:
+                _lines = []
+                for _h in _prev:
+                    _lines.append(f"  · {_h['created_at']}  「{_h['content']}」")
+                _history_prefix = "⚠️ 你已在该笔记下评论过：\n" + "\n".join(_lines) + "\n本次仍已发送。\n\n"
+
         # 访问帖子链接
         await main_page.goto(processed_url, timeout=60000)
         await asyncio.sleep(5)  # 等待页面加载
@@ -1679,10 +1755,12 @@ async def post_comment(url: str, comment: str) -> str:
                 print(f"使用JavaScript点击发送按钮出错: {str(e)}")
         
         if send_success:
-            return f"已成功发布评论：{comment}"
+            if _note_id:
+                _record_comment('commented', _note_id, content=comment)
+            return f"{_history_prefix}已成功发布评论：{comment}"
         else:
             return f"发布评论失败，请检查评论内容或网络连接"
-    
+
     except Exception as e:
         return f"发布评论时出错: {str(e)}"
 
@@ -2565,6 +2643,18 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
     if err:
         return err
 
+    # 查历史回复记录
+    _reply_history_prefix = ''
+    try:
+        _prev_replies = _get_comment_history(note_id, action_type='replied', comment_id=comment_id)
+        if _prev_replies:
+            _lines = []
+            for _h in _prev_replies:
+                _lines.append(f"  · {_h['created_at']}  「{_h['content']}」")
+            _reply_history_prefix = "⚠️ 你已回复过该评论：\n" + "\n".join(_lines) + "\n本次仍已发送。\n\n"
+    except Exception:
+        pass
+
     try:
         await _rand_sleep(2)  # 等评论区加载
 
@@ -2610,12 +2700,39 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
             return "找不到提交按钮"
         await submit_btn.click()
         await _rand_sleep(1.5)
-        return f"✅ 回复成功"
+        _record_comment('replied', note_id, comment_id=comment_id, content=content)
+        return f"{_reply_history_prefix}✅ 回复成功"
 
     except Exception as e:
         return f"回复失败：{e}"
     finally:
         await page.close()
+
+
+@mcp.tool()
+async def get_comment_history(note_id: str = "", limit: int = 20) -> str:
+    """查询自己的评论/回复历史。可用于检查某篇笔记是否已评论过。
+
+    Args:
+        note_id: 筛选特定笔记（留空查全部最近记录）
+        limit: 返回条数，默认 20
+    """
+    try:
+        records = _get_comment_history(note_id=note_id)
+        records = records[:limit]
+        if not records:
+            return "暂无评论/回复历史记录。"
+        lines = [f"评论历史（共 {len(records)} 条）：\n"]
+        for i, r in enumerate(records, 1):
+            if r['action_type'] == 'replied' and r['comment_id']:
+                target = f"笔记 {r['note_id']} → 评论 {r['comment_id']}"
+            else:
+                target = f"笔记 {r['note_id']}"
+            lines.append(f"{i}. [{r['action_type']}] {r['created_at']}  {target}")
+            lines.append(f"   内容：「{r['content']}」\n")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"查询历史失败：{e}"
 
 
 @mcp.tool()
