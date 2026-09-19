@@ -58,3 +58,4 @@ AI-learn-resource/
 
 # 登录状态（包含 Cookie，不要上传）
 xhs_state.json
+*.bak.*
