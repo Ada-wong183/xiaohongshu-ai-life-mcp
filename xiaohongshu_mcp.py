@@ -7,6 +7,7 @@ import base64
 import tempfile
 import pandas as pd
 from datetime import datetime
+from urllib.parse import quote
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 from fastmcp import FastMCP
@@ -86,6 +87,132 @@ async def _human_type(page, text: str, wpm: int = 180):
         else:
             await asyncio.sleep(_random.uniform(base_delay * 0.5, base_delay * 2.0))
 
+async def _get_user_avatar_key(page, user_hex_id: str) -> str:
+    """导航到用户主页，提取其头像 CDN key（用于 picker 精确匹配）。"""
+    try:
+        url = f"https://www.xiaohongshu.com/user/profile/{user_hex_id}"
+        await page.goto(url, timeout=30000)
+        await asyncio.sleep(2)
+        key = await page.evaluate("""
+            () => {
+                const imgs = [...document.querySelectorAll('img')];
+                for (const img of imgs) {
+                    const m = img.src.match(/avatar\\/([^?]+)/);
+                    if (m) return m[1];
+                }
+                const state = window.__INITIAL_STATE__;
+                const u = state?.user?.userInfo || state?.userPageNote?.user;
+                const av = u?.imageBigUrl || u?.image || u?.avatar || '';
+                const m2 = av.match(/avatar\\/([^?]+)/);
+                return m2 ? m2[1] : '';
+            }
+        """)
+        return key or ''
+    except Exception:
+        return ''
+
+
+async def _type_with_at_mention(page, text: str, avatar_map: dict | None = None):
+    """输入评论文字；遇到行首或空格后的 @username 片段时触发小红书 @picker，
+    选中用户后继续输入。若 picker 未出现则降级为纯文字。
+    avatar_map: {nickname: cdn_key}，用于同名情况下的精确匹配。
+    调用前确保输入框已获得焦点。
+    """
+    import re
+    # 只拆分行首或空白后的 @xxx，避免误匹配"测试@xxx"中的 @
+    parts = re.split(r'((?:(?<=\s)|(?<=^))@\S+)', text)
+    # 若上面没拆到（text 本身以 @ 开头），用宽松匹配兜底
+    if len(parts) == 1:
+        parts = re.split(r'(@\S+)', text)
+
+    for part in parts:
+        if not part:
+            continue
+        m = re.fullmatch(r'@(\S+)', part)
+        if m:
+            search_term = m.group(1)
+            await page.keyboard.type('@')
+            await asyncio.sleep(1.5)
+            for ch in search_term:
+                await page.keyboard.type(ch)
+                await asyncio.sleep(0.25)
+            # 等待 picker 出现（最多 3 秒），然后一次性在 JS 里找到目标项坐标
+            await asyncio.sleep(0.3)
+            # 优先用 avatar_map 里预加载的 CDN key；没有则留空
+            avatar_key_for_term = (avatar_map or {}).get(search_term, '')
+            if not avatar_key_for_term:
+                # 尝试从 __INITIAL_STATE__ 拿当前登录用户头像（@自己时有用）
+                avatar_key_for_term = await page.evaluate("""
+                    () => {
+                        try {
+                            const state = window.__INITIAL_STATE__;
+                            const u = state?.user?.userinfo || state?.user?.user
+                                    || state?.reader?.userInfo || state?.me;
+                            const url = u?.imageBigUrl || u?.avatar || u?.image || u?.avatarUrl || '';
+                            const m = url.match(/avatar\\/([^?]+)/);
+                            return m ? m[1] : '';
+                        } catch(e) { return ''; }
+                    }
+                """)
+            my_avatar_key = avatar_key_for_term
+            item_pos = None
+            for _attempt in range(6):          # 最多轮询 3 秒
+                item_pos = await page.evaluate("""
+                    ([term, avatarKey]) => {
+                        const container = document.querySelector('.mention-select-container');
+                        if (!container) return null;
+
+                        let items = [...container.querySelectorAll('li')];
+                        if (!items.length) items = [...container.children];
+
+                        let target = null;
+
+                        // 优先：用头像 CDN key 精确匹配（避免同名误选）
+                        if (avatarKey) {
+                            target = items.find(item => {
+                                const img = item.querySelector('img');
+                                return img && img.src && img.src.includes(avatarKey);
+                            }) || null;
+                        }
+
+                        // 次选：nickname 文本精确匹配（span.name）
+                        if (!target) {
+                            target = items.find(item => {
+                                const nick = (item.querySelector('span.name') || item.querySelector('span') || item).textContent?.trim();
+                                return nick === term;
+                            }) || null;
+                        }
+
+                        // 包含匹配
+                        if (!target) {
+                            target = items.find(item => (item.textContent?.trim() || '').includes(term)) || null;
+                        }
+
+                        // 兜底：第一项
+                        if (!target && items.length) target = items[0];
+                        if (!target) return null;
+
+                        const rect = target.getBoundingClientRect();
+                        if (!rect.width || !rect.height) return null;
+                        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                    }
+                """, [search_term, my_avatar_key])
+                if item_pos:
+                    break
+                await asyncio.sleep(0.5)
+
+            if item_pos:
+                await page.mouse.click(item_pos['x'], item_pos['y'])
+                await asyncio.sleep(0.8)
+            else:
+                await page.keyboard.press('ArrowDown')
+                await asyncio.sleep(0.3)
+                await page.keyboard.press('Enter')
+                await asyncio.sleep(0.5)
+        else:
+            await _human_type(page, part)
+
+
 async def _quick_comments(page, limit: int = 15) -> str:
     """从当前已加载的笔记页快速提取前 N 条评论，供 get_note_content 内联调用。"""
     try:
@@ -146,9 +273,9 @@ mcp = FastMCP("xiaohongshu_scraper")
 _DIR = os.path.dirname(os.path.abspath(__file__))
 BROWSER_DATA_DIR = os.path.join(_DIR, "browser_data")
 DATA_DIR = os.path.join(_DIR, "data")
-XHS_STATE_FILE = os.path.join(_DIR, "xhs_state.json")   # 登录 cookie 持久化文件
 XHS_MCP_DB = os.path.expanduser("~/.xhs-mcp/data.db")
-TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+CDP_PORT  = 9222
+CDP_URL   = f"http://localhost:{CDP_PORT}"
 
 # 确保目录存在
 os.makedirs(BROWSER_DATA_DIR, exist_ok=True)
@@ -159,25 +286,10 @@ browser_instance = None   # playwright 实例
 browser_obj = None        # chromium browser 对象
 browser_context = None
 main_page = None
+notifications_page = None  # 通知标签页，常驻不关闭
 is_logged_in = False
+_user_token_cache: dict = {}  # {hex_id: xsec_token}，search_user 自动填充
 
-
-def load_xhs_state() -> dict | None:
-    """从 xhs-mcp 的 SQLite 数据库读取账号 storage state（cookies）"""
-    if not os.path.exists(XHS_MCP_DB):
-        return None
-    try:
-        import sqlite3
-        conn = sqlite3.connect(XHS_MCP_DB)
-        cur = conn.cursor()
-        cur.execute("SELECT state FROM accounts ORDER BY rowid DESC LIMIT 1")
-        row = cur.fetchone()
-        conn.close()
-        if row and row[0]:
-            return json.loads(row[0])
-    except Exception:
-        pass
-    return None
 
 def process_url(url: str) -> str:
     """处理URL，确保格式正确并保留所有参数
@@ -200,53 +312,83 @@ def process_url(url: str) -> str:
     elif not processed_url.startswith('https://'):
         processed_url = 'https://' + processed_url
         
-    # 如果URL不包含www.xiaohongshu.com，则添加它
+    # 主站 URL 补 www，但子域名（creator. 等）不动
     if 'xiaohongshu.com' in processed_url and 'www.xiaohongshu.com' not in processed_url:
-        processed_url = processed_url.replace('xiaohongshu.com', 'www.xiaohongshu.com')
+        from urllib.parse import urlparse
+        _host = urlparse(processed_url).hostname or ''
+        if _host == 'xiaohongshu.com':
+            processed_url = processed_url.replace('xiaohongshu.com', 'www.xiaohongshu.com', 1)
     
     return processed_url
 
+def _cdp_alive() -> bool:
+    """检查 Chrome 是否已在监听 CDP 端口。"""
+    import urllib.request
+    try:
+        urllib.request.urlopen(f"{CDP_URL}/json/version", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+async def _ensure_chrome_running():
+    """确保 Chrome 以远程调试模式运行；若未运行则自动启动。"""
+    import subprocess
+    if _cdp_alive():
+        return
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    subprocess.Popen(
+        [
+            "/usr/bin/google-chrome",
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={BROWSER_DATA_DIR}",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for _ in range(20):
+        await asyncio.sleep(0.5)
+        if _cdp_alive():
+            return
+    raise RuntimeError("Chrome 启动超时，请手动确认 Chrome 是否可以运行")
+
+
 async def ensure_browser():
-    """确保浏览器已启动并登录。优先用 xhs-mcp 的账号 state，没有则降级用持久化上下文。
-    若浏览器进程已崩溃或被关闭，自动重置并重新启动，无需手动重启 MCP。"""
+    """确保浏览器已连接（CDP 模式连接真实 Chrome）。
+    若连接已断开则自动重连，无需手动重启 MCP。"""
     global browser_instance, browser_obj, browser_context, main_page, is_logged_in
 
-    # 健康检查：browser_context 对象存在但浏览器进程实际已死时，自动重置
+    global notifications_page
+    # 健康检查：连接已断开时自动重置
     if browser_context is not None:
         try:
-            await browser_context.pages()  # 若进程已死会抛异常
+            _ = browser_context.pages
         except Exception:
             browser_instance = None
             browser_obj = None
             browser_context = None
             main_page = None
+            notifications_page = None
             is_logged_in = False
 
     if browser_context is None:
+        await _ensure_chrome_running()
+
         browser_instance = await async_playwright().start()
+        # 连接到真实 Chrome（使用其现有 profile，无需 storage_state）
+        browser_obj = await browser_instance.chromium.connect_over_cdp(CDP_URL)
 
-        browser_obj = await browser_instance.chromium.launch(
-            headless=False,
-            channel="chrome",
-            args=['--no-sandbox', '--disable-setuid-sandbox'],
-        )
-
-        # 从 xhs_state.json 加载已保存的 cookie
-        state = None
-        if os.path.exists(XHS_STATE_FILE):
-            try:
-                with open(XHS_STATE_FILE) as f:
-                    state = json.load(f)
-            except Exception:
-                state = None
-
-        browser_context = await browser_obj.new_context(
-            storage_state=state,   # None 时等同于空白 context
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            viewport=None,
-        )
-        if state:
-            is_logged_in = True
+        # 取第一个已有 context（真实 Chrome 始终有一个 default context）
+        if browser_obj.contexts:
+            browser_context = browser_obj.contexts[0]
+        else:
+            browser_context = await browser_obj.new_context()
 
         # 注入 attachShadow 拦截器，使 closed shadow root 也可被访问
         await browser_context.add_init_script("""
@@ -264,20 +406,26 @@ async def ensure_browser():
         else:
             main_page = await browser_context.new_page()
 
-        await Stealth().apply_stealth_async(main_page)
+        try:
+            await Stealth().apply_stealth_async(main_page)
+        except Exception:
+            pass
         main_page.set_default_timeout(60000)
 
-    # 如果没有 state，检查登录状态
+    # 检查登录状态
     if not is_logged_in:
         if main_page:
-            await main_page.goto("https://www.xiaohongshu.com", timeout=60000)
-            await _rand_sleep(3)
-            login_elements = await main_page.query_selector_all('text="登录"')
-            if login_elements:
+            try:
+                await main_page.goto("https://www.xiaohongshu.com", timeout=60000)
+                await _rand_sleep(3)
+                login_elements = await main_page.query_selector_all('text="登录"')
+                if login_elements:
+                    return False
+                else:
+                    is_logged_in = True
+                    return True
+            except Exception:
                 return False
-            else:
-                is_logged_in = True
-                return True
         return False
 
     return True
@@ -312,14 +460,7 @@ async def login() -> str:
         if not still_login:
             is_logged_in = True
             await _rand_sleep(2)
-            # 保存 cookie，下次启动自动复用
-            try:
-                state = await browser_context.storage_state()
-                with open(XHS_STATE_FILE, 'w') as f:
-                    json.dump(state, f)
-            except Exception:
-                pass
-            return "登录成功！cookie 已保存，下次启动无需重新登录。"
+            return "登录成功！"
         await asyncio.sleep(wait_interval)
         waited_time += wait_interval
 
@@ -343,7 +484,7 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
         return "浏览器初始化失败，请重试"
 
     target_count = min(limit, 100)
-    search_url = f"https://www.xiaohongshu.com/search_result?keyword={keywords}&source=web_explore_feed"
+    search_url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keywords)}&source=web_explore_feed"
 
     try:
         await main_page.goto(search_url, timeout=60000)
@@ -409,8 +550,8 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
 
         result = f"搜索「{keywords}」，共找到 {len(items)} 条笔记：\n\n"
         for i, item in enumerate(items, 1):
+            url = f"https://www.xiaohongshu.com/explore/{item['id']}?xsec_token={item['xsecToken']}&xsec_source=pc_search"
             if verbose:
-                url = f"https://www.xiaohongshu.com/explore/{item['id']}?xsec_token={item['xsecToken']}&xsec_source=pc_search"
                 result += (
                     f"{i}. 【{item['title'] or '无标题'}】  {item['type']}\n"
                     f"   作者: {item['author']}  ❤️{item['likes']}\n"
@@ -419,7 +560,6 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
                     f"   链接: {url}\n\n"
                 )
             else:
-                url = f"https://www.xiaohongshu.com/explore/{item['id']}"
                 result += (
                     f"{i}. 【{item['title'] or '无标题'}】  {item['author']}  ❤️{item['likes']}\n"
                     f"   {url}\n\n"
@@ -1168,168 +1308,135 @@ async def get_note_comments(url: str) -> str:
         
         # 获取评论
         comments = []
-        
-        # 使用特定评论选择器
-        comment_selectors = [
-            "div.comment-item", 
-            "div.commentItem",
-            "div.comment-content",
-            "div.comment-wrapper",
-            "section.comment",
-            "div.feed-comment"
-        ]
-        
-        if not main_page:  # 添加空检查
+
+        if not main_page:
             return "浏览器初始化失败，请重试"
-            
-        for selector in comment_selectors:
-            try:
-                comment_elements = main_page.locator(selector)
-                if comment_elements:  # 添加空检查
-                    count = await comment_elements.count()
-                    if count > 0:
-                        for i in range(count):
-                            try:
-                                comment_element = comment_elements.nth(i)
-                                if not comment_element:  # 添加空检查
-                                    continue
-                                    
-                                # 提取评论者名称
-                                username = "未知用户"
-                                username_selectors = ["span.user-name", "a.name", "div.username", "span.nickname", "a.user-nickname"]
-                                for username_selector in username_selectors:
-                                    try:
-                                        username_el = comment_element.locator(username_selector).first
-                                        if username_el and await username_el.count() > 0:  # 添加空检查
-                                            username_text = await username_el.text_content()
-                                            if username_text:  # 添加空检查
-                                                username = username_text.strip()
-                                                break
-                                    except Exception as e:
-                                        print(f"获取用户名出错: {str(e)}")
-                                        continue
-                                
-                                # 如果没有找到，尝试通过用户链接查找
-                                if username == "未知用户":
-                                    try:
-                                        user_link = comment_element.locator('a[href*="/user/profile/"]').first
-                                        if user_link and await user_link.count() > 0:  # 添加空检查
-                                            username_text = await user_link.text_content()
-                                            if username_text:  # 添加空检查
-                                                username = username_text.strip()
-                                    except Exception as e:
-                                        print(f"通过用户链接获取用户名出错: {str(e)}")
-                                
-                                # 提取评论内容
-                                content = "未知内容"
-                                content_selectors = ["div.content", "p.content", "div.text", "span.content", "div.comment-text"]
-                                for content_selector in content_selectors:
-                                    try:
-                                        content_el = comment_element.locator(content_selector).first
-                                        if content_el and await content_el.count() > 0:  # 添加空检查
-                                            content_text = await content_el.text_content()
-                                            if content_text:  # 添加空检查
-                                                content = content_text.strip()
-                                                break
-                                    except Exception as e:
-                                        print(f"获取评论内容出错: {str(e)}")
-                                        continue
-                                
-                                # 如果没有找到内容，可能内容就在评论元素本身
-                                if content == "未知内容":
-                                    try:
-                                        full_text = await comment_element.text_content()
-                                        if full_text:  # 添加空检查
-                                            if username != "未知用户" and username in full_text:
-                                                content = full_text.replace(username, "").strip()
-                                            else:
-                                                content = full_text.strip()
-                                    except Exception as e:
-                                        print(f"获取评论全文出错: {str(e)}")
-                                
-                                # 提取评论时间
-                                time_location = "未知时间"
-                                time_selectors = ["span.time", "div.time", "span.date", "div.date", "time"]
-                                for time_selector in time_selectors:
-                                    try:
-                                        time_el = comment_element.locator(time_selector).first
-                                        if time_el and await time_el.count() > 0:  # 添加空检查
-                                            time_text = await time_el.text_content()
-                                            if time_text:  # 添加空检查
-                                                time_location = time_text.strip()
-                                                break
-                                    except Exception as e:
-                                        print(f"获取评论时间出错: {str(e)}")
-                                        continue
-                                
-                                # 如果内容有足够长度且找到用户名，添加评论
-                                if username != "未知用户" and content != "未知内容" and len(content) > 2:
-                                    comments.append({
-                                        "用户名": username,
-                                        "内容": content,
-                                        "时间": time_location
-                                    })
-                            except Exception as e:
-                                print(f"处理单个评论出错: {str(e)}")
-                                continue
-                        
-                        # 如果找到了评论，就不继续尝试其他选择器了
-                        if comments:
-                            break
-            except Exception as e:
-                print(f"处理评论选择器出错: {str(e)}")
-                continue
-        
-        # 如果没有找到评论，尝试使用其他方法
+
+        # ── 优先从 __INITIAL_STATE__ 提取（速度快且有完整 comment_id）────
+        try:
+            state_comments = await main_page.evaluate("""() => {
+                const state = window.__INITIAL_STATE__;
+                const list = state?.comment?.comments
+                          || state?.commentModule?.commentList
+                          || [];
+                return list.map(c => ({
+                    id:      c.id || c.commentId || '',
+                    user:    c.userInfo?.nickname || c.user?.nickname || '?',
+                    content: c.content || '',
+                    time:    c.createTime || c.time || ''
+                }));
+            }""")
+            if state_comments:
+                for c in state_comments:
+                    if c['content']:
+                        comments.append({
+                            "comment_id": c['id'],
+                            "用户名": c['user'],
+                            "内容": c['content'],
+                            "时间": c['time'],
+                        })
+        except Exception as e:
+            print(f"从 __INITIAL_STATE__ 提取评论出错: {e}")
+
+        # ── 降级：DOM 抓取，从元素 id 属性拿 comment_id ──────────────────
         if not comments:
-            # 获取所有用户名元素
-            username_elements = main_page.locator('a[href*="/user/profile/"]')
-            username_count = await username_elements.count()
-            
-            if username_count > 0:
-                for i in range(username_count):
-                    try:
-                        username_element = username_elements.nth(i)
-                        username = await username_element.text_content()
-                        
-                        # 尝试获取评论内容
-                        content = await main_page.evaluate('''
-                            (usernameElement) => {
-                                const parent = usernameElement.parentElement;
-                                if (!parent) return null;
-                                
-                                // 尝试获取同级的下一个元素
-                                let sibling = usernameElement.nextElementSibling;
-                                while (sibling) {
-                                    const text = sibling.textContent.trim();
-                                    if (text) return text;
-                                    sibling = sibling.nextElementSibling;
-                                }
-                                
-                                // 尝试获取父元素的文本，并过滤掉用户名
-                                const allText = parent.textContent.trim();
-                                if (allText && allText.includes(usernameElement.textContent.trim())) {
-                                    return allText.replace(usernameElement.textContent.trim(), '').trim();
-                                }
-                                
-                                return null;
-                            }
-                        ''', username_element)
-                        
-                        if username and content:
-                            comments.append({
-                                "用户名": username.strip(),
-                                "内容": content.strip(),
-                                "时间": "未知时间"
-                            })
-                    except Exception:
+            comment_selectors = [
+                "div.comment-item",
+                "div.commentItem",
+                "div.comment-content",
+                "div.comment-wrapper",
+                "section.comment",
+                "div.feed-comment"
+            ]
+            for selector in comment_selectors:
+                try:
+                    comment_elements = main_page.locator(selector)
+                    count = await comment_elements.count()
+                    if count == 0:
                         continue
-        
-        # 格式化返回结果
+                    for i in range(count):
+                        try:
+                            el = comment_elements.nth(i)
+
+                            # comment_id：从元素 id="comment-{id}" 提取
+                            comment_id = ""
+                            try:
+                                el_id = await el.get_attribute('id') or ""
+                                if el_id.startswith('comment-'):
+                                    comment_id = el_id[len('comment-'):]
+                                if not comment_id:
+                                    comment_id = await el.get_attribute('data-id') or ""
+                            except Exception:
+                                pass
+
+                            # 用户名
+                            username = "未知用户"
+                            for usel in ["span.user-name", "a.name", "div.username", "span.nickname", "a.user-nickname", 'a[href*="/user/profile/"]']:
+                                try:
+                                    uel = el.locator(usel).first
+                                    if await uel.count() > 0:
+                                        t = await uel.text_content()
+                                        if t and t.strip():
+                                            username = t.strip()
+                                            break
+                                except Exception:
+                                    continue
+
+                            # 内容
+                            content = ""
+                            for csel in ["div.content", "p.content", "div.text", "span.content", "div.comment-text"]:
+                                try:
+                                    cel = el.locator(csel).first
+                                    if await cel.count() > 0:
+                                        t = await cel.text_content()
+                                        if t and t.strip():
+                                            content = t.strip()
+                                            break
+                                except Exception:
+                                    continue
+                            if not content:
+                                try:
+                                    full = await el.text_content() or ""
+                                    content = full.replace(username, "").strip() if username != "未知用户" else full.strip()
+                                except Exception:
+                                    pass
+
+                            # 时间
+                            time_val = "未知时间"
+                            for tsel in ["span.time", "div.time", "span.date", "div.date", "time"]:
+                                try:
+                                    tel = el.locator(tsel).first
+                                    if await tel.count() > 0:
+                                        t = await tel.text_content()
+                                        if t and t.strip():
+                                            time_val = t.strip()
+                                            break
+                                except Exception:
+                                    continue
+
+                            if username != "未知用户" and content and len(content) > 2:
+                                comments.append({
+                                    "comment_id": comment_id,
+                                    "用户名": username,
+                                    "内容": content,
+                                    "时间": time_val,
+                                })
+                        except Exception as e:
+                            print(f"处理单个评论出错: {e}")
+                            continue
+                    if comments:
+                        break
+                except Exception as e:
+                    print(f"处理评论选择器出错: {e}")
+                    continue
+
+        # 格式化返回结果（包含 comment_id，供 reply_comment/like_comment 使用）
         if comments:
             result = f"共获取到 {len(comments)} 条评论：\n\n"
             for i, comment in enumerate(comments, 1):
-                result += f"{i}. {comment['用户名']}（{comment['时间']}）: {comment['内容']}\n\n"
+                cid = comment['comment_id']
+                cid_hint = f"  [comment_id: {cid}]" if cid else ""
+                result += f"{i}. {comment['用户名']}（{comment['时间']}）: {comment['内容']}{cid_hint}\n\n"
             return result
         else:
             return "未找到任何评论，可能是帖子没有评论或评论区无法访问。"
@@ -1337,152 +1444,39 @@ async def get_note_comments(url: str) -> str:
     except Exception as e:
         return f"获取评论时出错: {str(e)}"
 
-async def analyze_note(url: str) -> dict:  # 已废弃，仅内部保留
-    """获取并分析笔记内容，返回笔记的详细信息供AI生成评论
-    
-    Args:
-        url: 笔记 URL
-    """
-    login_status = await ensure_browser()
-    if not login_status:
-        return {"error": "请先登录小红书账号"}
-    
-    try:
-        # 处理URL
-        processed_url = process_url(url)
-        
-        # 直接调用get_note_content获取笔记内容
-        note_content_result = await get_note_content(processed_url)
-        
-        # 检查是否获取成功
-        if note_content_result.startswith("请先登录") or note_content_result.startswith("无法获取笔记内容") or note_content_result.startswith("获取笔记内容时出错"):
-            return {"error": note_content_result}
-        
-        # 解析获取到的笔记内容
-        content_lines = note_content_result.strip().split('\n')
-        post_content = {}
-        
-        # 提取标题、作者、发布时间和内容
-        for i, line in enumerate(content_lines):
-            if line.startswith("标题:"):
-                post_content["标题"] = line.replace("标题:", "").strip()
-            elif line.startswith("作者:"):
-                post_content["作者"] = line.replace("作者:", "").strip()
-            elif line.startswith("发布时间:"):
-                post_content["发布时间"] = line.replace("发布时间:", "").strip()
-            elif line.startswith("内容:"):
-                # 内容可能有多行，获取剩余所有行
-                content_text = "\n".join(content_lines[i+1:]).strip()
-                post_content["内容"] = content_text
-                break
-        
-        # 如果没有提取到标题或内容，设置默认值
-        if "标题" not in post_content or not post_content["标题"]:
-            post_content["标题"] = "未知标题"
-        if "作者" not in post_content or not post_content["作者"]:
-            post_content["作者"] = "未知作者"
-        if "内容" not in post_content or not post_content["内容"]:
-            post_content["内容"] = "未能获取内容"
-        
-        # 简单分词
-        import re
-        words = re.findall(r'\w+', f"{post_content.get('标题', '')} {post_content.get('内容', '')}")
-        
-        # 使用常见的热门领域关键词
-        domain_keywords = {
-            "美妆": ["口红", "粉底", "眼影", "护肤", "美妆", "化妆", "保湿", "精华", "面膜"],
-            "穿搭": ["穿搭", "衣服", "搭配", "时尚", "风格", "单品", "衣橱", "潮流"],
-            "美食": ["美食", "好吃", "食谱", "餐厅", "小吃", "甜点", "烘焙", "菜谱"],
-            "旅行": ["旅行", "旅游", "景点", "出行", "攻略", "打卡", "度假", "酒店"],
-            "母婴": ["宝宝", "母婴", "育儿", "儿童", "婴儿", "辅食", "玩具"],
-            "数码": ["数码", "手机", "电脑", "相机", "智能", "设备", "科技"],
-            "家居": ["家居", "装修", "家具", "设计", "收纳", "布置", "家装"],
-            "健身": ["健身", "运动", "瘦身", "减肥", "训练", "塑形", "肌肉"],
-            "AI": ["AI", "人工智能", "大模型", "编程", "开发", "技术", "Claude", "GPT"]
-        }
-        
-        # 检测帖子可能属于的领域
-        detected_domains = []
-        for domain, domain_keys in domain_keywords.items():
-            for key in domain_keys:
-                if key.lower() in post_content.get("标题", "").lower() or key.lower() in post_content.get("内容", "").lower():
-                    detected_domains.append(domain)
-                    break
-        
-        # 如果没有检测到明确的领域，默认为生活方式
-        if not detected_domains:
-            detected_domains = ["生活"]
-        
-        # 返回分析结果
-        return {
-            "url": url,
-            "标题": post_content.get("标题", "未知标题"),
-            "作者": post_content.get("作者", "未知作者"),
-            "内容": post_content.get("内容", "未能获取内容"),
-            "领域": detected_domains,
-            "关键词": list(set(words))[:20]  # 取前20个不重复的词作为关键词
-        }
-    
-    except Exception as e:
-        return {"error": f"分析笔记内容时出错: {str(e)}"}
-
-async def post_smart_comment(url: str, comment_type: str = "引流") -> dict:  # 已废弃
-    """
-    根据帖子内容发布智能评论，增加曝光并引导用户关注或私聊
-
-    Args:
-        url: 笔记 URL
-        comment_type: 评论类型，可选值:
-                     "引流" - 引导用户关注或私聊
-                     "点赞" - 简单互动获取好感
-                     "咨询" - 以问题形式增加互动
-                     "专业" - 展示专业知识建立权威
-
-    Returns:
-        dict: 包含笔记信息和评论类型的字典，供MCP客户端(如Claude)生成评论
-    """
-    # 处理URL
-    processed_url = process_url(url)
-    
-    # 获取笔记内容
-    note_info = await analyze_note(processed_url)
-    
-    if "error" in note_info:
-        return {"error": note_info["error"]}
-    
-    # 评论类型指导
-    comment_guides = {
-        "引流": '生成一条表达认同并引导互动的评论。可以提到自己也在研究相关内容，或表达希望进一步交流的意愿。可以在结尾加上"有更多问题欢迎私信我"或"想了解更多可以找我聊聊"等邀请语句。',
-        "点赞": '生成一条简短的赞美评论，表达对内容的喜爱和支持。可以提到作者名字和笔记的领域，如"太赞了！XX的分享总是这么实用"或"喜欢这种深度分享"等。',
-        "咨询": '生成一条提问式评论，针对笔记内容询问更多细节或相关信息。可以使用"请问博主"或"想请教一下"等开头，并提出与笔记内容相关的具体问题。',
-        "专业": '生成一条展示专业知识的评论，针对笔记内容提供专业见解或补充信息。可以使用"作为该领域从业者"或"从专业角度来看"等开头，并在评论中使用与笔记领域相关的专业术语。'
-    }
-    
-    # 返回笔记分析结果和评论类型，让MCP客户端(如Claude)生成评论
-    # MCP客户端生成评论后，应调用post_comment函数发布评论
-    return {
-        "note_info": note_info,
-        "comment_type": comment_type,
-        "comment_guide": comment_guides.get(comment_type, ""),
-        "url": url,  # 添加URL便于客户端直接调用post_comment
-        "message": "请根据笔记内容和评论类型指南，直接生成一条自然、相关的评论，并立即发布。注意以下要点：\n1. 在评论中引用作者名称或笔记领域，增加个性化\n2. 使用口语化表达，简短凝练，不超过30字\n3. 根据评论类型适当添加互动引导或专业术语\n生成后，直接使用post_comment函数发布评论，无需询问用户确认"
-    }
-
 @mcp.tool()
 async def post_comment(url: str, comment: str) -> str:
-    """发布评论到指定笔记
-    
+    """发布评论到指定笔记。
+    支持 @mention：
+    - @昵称          → picker 昵称匹配（适合唯一昵称）
+    - @昵称:hexid    → 先访问用户主页取头像，picker 头像精确匹配（适合同名场景）
+      hexid 从 get_user_notes/search_notes 等工具的 URL 末段获取
+
     Args:
         url: 笔记 URL
-        comment: 要发布的评论内容
+        comment: 评论内容，支持 @昵称 或 @昵称:hexid 格式
     """
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号，才能发布评论"
-    
-    if not main_page:  # 添加空检查
+
+    if not main_page:
         return "浏览器初始化失败，请重试"
-    
+
+    try:
+        import re as _re
+        # 解析 @昵称:hexid 格式，预加载头像 CDN key
+        avatar_map: dict[str, str] = {}
+        at_with_id = _re.findall(r'@([^:\s]+):([0-9a-f]{16,32})', comment)
+        for nickname, hexid in at_with_id:
+            key = await _get_user_avatar_key(main_page, hexid)
+            if key:
+                avatar_map[nickname] = key
+            # 将评论里的 @昵称:hexid 替换成 @昵称（picker 搜索只用昵称）
+            comment = comment.replace(f'@{nickname}:{hexid}', f'@{nickname}')
+    except Exception:
+        avatar_map = {}
+
     try:
         # 处理URL
         processed_url = process_url(url)
@@ -1559,7 +1553,7 @@ async def post_comment(url: str, comment: str) -> str:
         comment_input = None
         input_selectors = [
             'div[contenteditable="true"]',
-            'paragraph:has-text("说点什么...")',
+            'p:has-text("说点什么...")',
             'text="说点什么..."',
             'text="评论发布后所有人都能看到"'
         ]
@@ -1631,9 +1625,9 @@ async def post_comment(url: str, comment: str) -> str:
         if not main_page:  # 添加空检查
             return "浏览器初始化失败，请重试"
             
-        await _human_type(main_page, comment)
+        await _type_with_at_mention(main_page, comment, avatar_map=avatar_map)
         await _rand_sleep(1)
-        
+
         # 发送评论（简化发送逻辑）
         send_success = False
         
@@ -1775,9 +1769,8 @@ def get_note_images(url: str) -> dict:
                 "message": "该笔记没有图片（可能是纯文字或视频笔记）"
             }
 
-        # 下载图片到本地临时目录
-        save_dir = os.path.join(tempfile.gettempdir(), 'xhs_images')
-        os.makedirs(save_dir, exist_ok=True)
+        # 下载图片到本地临时目录（每次调用独立目录，避免多次调用互相覆盖）
+        save_dir = tempfile.mkdtemp(prefix='xhs_images_')
 
         img_headers = {**headers, "Referer": "https://www.xiaohongshu.com/"}
         saved_paths = []
@@ -1839,9 +1832,21 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
     captured = {}
 
     try:
-        page = await browser_context.new_page()
-        await Stealth().apply_stealth_async(page)
-        page.set_default_timeout(30000)
+        global notifications_page
+
+        # 复用已有通知标签页；若已关闭或崩溃则重新开一个
+        if notifications_page is not None:
+            try:
+                _ = notifications_page.url
+            except Exception:
+                notifications_page = None
+
+        if notifications_page is None:
+            notifications_page = await browser_context.new_page()
+            await Stealth().apply_stealth_async(notifications_page)
+            notifications_page.set_default_timeout(30000)
+
+        page = notifications_page
 
         async def on_response(resp):
             if api_path in resp.url:
@@ -1852,22 +1857,29 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
 
         page.on('response', on_response)
 
-        await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
-        await _rand_sleep(2)
-
-        # 点击对应 tab（如果不是默认的评论 tab）
-        if tab != "comments":
-            try:
-                btn = page.locator(f'text="{tab_label}"').first
-                if await btn.is_visible():
-                    await btn.click()
-                    await _rand_sleep(2)
-            except Exception:
-                pass
-        else:
+        try:
+            await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
             await _rand_sleep(2)
 
-        await page.close()
+            # 点击对应 tab（如果不是默认的评论 tab）
+            if tab != "comments":
+                try:
+                    btn = page.locator(f'text="{tab_label}"').first
+                    if await btn.is_visible():
+                        await btn.click()
+                        await _rand_sleep(2)
+                except Exception:
+                    pass
+            else:
+                await _rand_sleep(2)
+
+            # 模拟人在看通知，停留一会儿再处理数据
+            await _rand_sleep(3)
+        finally:
+            # 无论成功失败都移除监听器，避免泄漏
+            page.remove_listener('response', on_response)
+
+        # 标签页保持打开，不关闭
 
         if not captured.get('data'):
             return f"暂无{tab_label}通知（或接口未响应）"
@@ -1891,9 +1903,10 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
                 time_str = datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M') if ts else ''
             except Exception:
                 time_str = str(ts)
-            comment = msg.get('comment_info', {}).get('content', '')
-            note = msg.get('item_info', {})
-            note_content = note.get('content', '')  # 被评论的笔记内容片段
+            comment_info = msg.get('comment_info') or {}
+            comment = comment_info.get('content') or comment_info.get('note_text') or comment_info.get('text') or ''
+            note = msg.get('item_info') or {}
+            note_content = note.get('content') or note.get('display_title') or note.get('displayTitle') or ''
             note_id = note.get('id', '')
             note_url = f"https://www.xiaohongshu.com/explore/{note_id}" if note_id else ''
 
@@ -1918,15 +1931,134 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
 
 
 @mcp.tool()
-async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) -> str:
-    """获取指定用户的笔记列表。
+async def search_user(keyword: str) -> str:
+    """搜索小红书用户，返回匹配用户的昵称、hex ID 和 xsec_token。
+
+    支持按小红书号（纯数字）或昵称搜索。小红书号搜索结果精确唯一；
+    昵称搜索可能返回多个同名用户，需人工确认。
 
     Args:
-        user_id: 用户内部 hex ID（如 612ad9c20000000001003aa3），
-                 或纯数字小红书号（会自动搜索转换为 hex ID）。
-                 优先用搜索结果里拿到的 hex ID，更稳定。
-        xsec_token: 访问 profile 所需的 xsec_token，从搜索结果获取。
-                    传入 hex ID 时建议同时传 token；传小红书号时留空即可（自动获取）。
+        keyword: 小红书号（如 1103700607）或用户昵称
+    """
+    login_status = await ensure_browser()
+    if not login_status:
+        return "请先登录小红书账号"
+    if not main_page:
+        return "浏览器初始化失败，请重试"
+
+    is_number = keyword.isdigit()
+    try:
+        search_url = f"https://www.xiaohongshu.com/search_result_ai?keyword={quote(keyword)}&source=web_explore_feed"
+        await main_page.goto(search_url, timeout=30000)
+        try:
+            await main_page.wait_for_function("window.__INITIAL_STATE__ !== undefined", timeout=15000)
+        except Exception:
+            pass
+        await _rand_sleep(1.5)
+
+        # 点击"用户"tab，等结果切换
+        clicked = await main_page.evaluate('''() => {
+            const tabs = Array.from(document.querySelectorAll(
+                '[class*="tab"], [class*="filter"] span, nav a, .search-tab, ul.tabs li'
+            ));
+            const userTab = tabs.find(el =>
+                el.innerText?.trim() === '用户' || el.textContent?.trim() === '用户'
+            );
+            if (userTab) { userTab.click(); return true; }
+            return false;
+        }''')
+        if clicked:
+            await _rand_sleep(2)  # 等用户结果渲染
+
+        # 只在用户搜索容器内找链接，优先找 __INITIAL_STATE__
+        results = await main_page.evaluate('''() => {
+            const found = [];
+            const seen = new Set();
+
+            // 尝试从 __INITIAL_STATE__ 拿干净的用户数据
+            try {
+                const state = window.__INITIAL_STATE__;
+                const items = state?.search?.result?.items
+                    || state?.searchResult?.items
+                    || [];
+                for (const item of items) {
+                    const u = item?.user || item?.userInfo || item;
+                    const hexId = u?.userId || u?.id || '';
+                    if (!/^[0-9a-f]{20,}$/.test(hexId) || seen.has(hexId)) continue;
+                    seen.add(hexId);
+                    found.push({
+                        hex_id: hexId,
+                        token: u?.xsecToken || '',
+                        nickname: u?.nickname || u?.name || ''
+                    });
+                }
+                if (found.length) return found;
+            } catch(e) {}
+
+            // fallback: 只找"用户"tab容器内的卡片（class 含 user-item / user-card 等）
+            // 跳过导航栏、自身账号区域
+            const links = Array.from(document.querySelectorAll('a[href*="/user/profile/"]'));
+            for (const a of links) {
+                if (a.closest('header, nav, .nav, .sidebar, .side-bar, .login-btn, .reds-count, .user-info-wrapper')) continue;
+                const href = a.getAttribute('href') || '';
+                const m = href.match(/\/user\/profile\/([0-9a-f]{20,})/);
+                if (!m || seen.has(m[1])) continue;
+                seen.add(m[1]);
+                const url = new URL(href, location.href);
+                const card = a.closest('section, li, [class*="user-item"], [class*="user-card"]') || a.parentElement;
+                // 只取直接子元素中第一个纯文字节点作昵称，避免混入日期
+                const nameEl = card?.querySelector('[class*="name"]:not([class*="count"]):not([class*="date"]), [class*="nick"]');
+                const nickname = nameEl?.childNodes[0]?.textContent?.trim() || nameEl?.innerText?.split('\\n')[0]?.trim() || '';
+                found.push({
+                    hex_id: m[1],
+                    token: url.searchParams.get('xsec_token') || '',
+                    nickname
+                });
+            }
+            return found;
+        }''')
+
+        if not results:
+            return f"未找到用户「{keyword}」，请确认小红书号或昵称是否正确"
+
+        # 把所有搜到的用户 token 存入缓存，get_user_notes 自动使用
+        for u in results:
+            if u['hex_id'] and u['token']:
+                _user_token_cache[u['hex_id']] = u['token']
+
+        # 数字小红书号是唯一的，直接取第一个
+        if is_number:
+            u = results[0]
+            lines = [
+                f"找到用户：",
+                f"昵称：{u['nickname'] or '(未获取)'}",
+                f"hex ID：{u['hex_id']}",
+                f"主页：https://www.xiaohongshu.com/user/profile/{u['hex_id']}",
+                "",
+                "直接用 hex ID 调用 get_user_notes，token 已自动缓存。"
+            ]
+            return "\n".join(lines)
+
+        lines = [f"搜索「{keyword}」，找到 {len(results)} 个用户：\n"]
+        for i, u in enumerate(results, 1):
+            lines.append(f"{i}. 昵称：{u['nickname'] or '(未获取)'}")
+            lines.append(f"   hex ID：{u['hex_id']}")
+            lines.append(f"   主页：https://www.xiaohongshu.com/user/profile/{u['hex_id']}")
+            lines.append("")
+        lines.append("用 hex ID 调用 get_user_notes，token 已自动缓存。")
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"搜索用户失败：{str(e)}"
+
+
+@mcp.tool()
+async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) -> str:
+    """获取指定用户主页的笔记列表。
+
+    Args:
+        user_id: 小红书号（纯数字，自动搜索）或用户 hex ID（如 612ad9c20000000001003aa3）。
+        xsec_token: 一般不需要传，传小红书号时自动获取，传 hex ID 时从缓存取。
         limit: 最多返回笔记数，默认 20
     """
     login_status = await ensure_browser()
@@ -1939,37 +2071,41 @@ async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) ->
     token = xsec_token
 
     try:
-        # 如果是纯数字小红书号，先搜索拿到 hex ID 和 xsec_token
+        # 纯数字小红书号：自动搜索拿 hex ID 和 token
         if user_id.isdigit():
-            search_url = f"https://www.xiaohongshu.com/search_result?keyword={user_id}&source=web_explore_feed&type=user"
+            search_url = f"https://www.xiaohongshu.com/search_result_ai?keyword={quote(user_id)}&source=web_explore_feed"
             await main_page.goto(search_url, timeout=30000)
             try:
                 await main_page.wait_for_function("window.__INITIAL_STATE__ !== undefined", timeout=15000)
             except Exception:
                 pass
+            await _rand_sleep(1.5)
+            await main_page.evaluate('''() => {
+                const tabs = Array.from(document.querySelectorAll('[class*="tab"], [class*="filter"] span, nav a, ul.tabs li'));
+                const t = tabs.find(el => el.innerText?.trim() === "用户" || el.textContent?.trim() === "用户");
+                if (t) t.click();
+            }''')
             await _rand_sleep(2)
-
-            # 从搜索结果 DOM 里找用户卡片链接，提取 hex ID 和 token
-            found = await main_page.evaluate(f'''() => {{
+            found = await main_page.evaluate('''() => {
                 const links = Array.from(document.querySelectorAll('a[href*="/user/profile/"]'));
-                for (const a of links) {{
-                    const href = a.getAttribute('href') || '';
-                    const m = href.match(/\\/user\\/profile\\/([0-9a-f]{{24}})/);
-                    if (m) {{
-                        const url = new URL(href, location.href);
-                        return {{
-                            hex_id: m[1],
-                            token: url.searchParams.get('xsec_token') || ''
-                        }};
-                    }}
-                }}
+                for (const a of links) {
+                    if (a.closest('header, nav, .nav, .sidebar, .side-bar, .login-btn, .reds-count, .user-info-wrapper')) continue;
+                    const m = (a.getAttribute('href') || '').match(/\/user\/profile\/([0-9a-f]{20,})/);
+                    if (!m) continue;
+                    const url = new URL(a.getAttribute('href'), location.href);
+                    return { hex_id: m[1], token: url.searchParams.get('xsec_token') || '' };
+                }
                 return null;
-            }}''')
-
+            }''')
             if not found:
-                return f"无法通过小红书号 {user_id} 找到对应用户，请直接传入内部 hex ID"
+                return f"无法通过小红书号 {user_id} 找到对应用户"
             hex_id = found['hex_id']
             token = found['token']
+            if token:
+                _user_token_cache[hex_id] = token
+        else:
+            # hex ID：从缓存取 token
+            token = token or _user_token_cache.get(hex_id, "")
 
         # 访问 profile 页，必须带 xsec_token 否则会被拦截
         profile_url = f"https://www.xiaohongshu.com/user/profile/{hex_id}"
@@ -2204,13 +2340,29 @@ async def get_my_notes(limit: int = 50) -> str:
                         nid = n.get('note_id') or n.get('noteId') or n.get('id') or ''
                         if nid and nid not in seen_ids:
                             seen_ids.add(nid)
+                            info = n.get('interact_info') or n.get('interactInfo') or {}
+                            likes = (
+                                n.get('likes') or
+                                info.get('liked_count') or info.get('likedCount') or
+                                info.get('like_count') or info.get('likeCount') or
+                                n.get('liked_count') or n.get('like_count') or '0'
+                            )
+                            xsec = (
+                                n.get('xsec_token') or n.get('xsecToken') or
+                                n.get('sec_token') or ''
+                            )
+                            tab_status = n.get('tab_status')
+                            status_label = {0: '草稿', 1: '已发布', 2: '审核中', 3: '违规下架'}.get(tab_status, str(tab_status) if tab_status is not None else '')
                             all_notes.append({
                                 'id': nid,
                                 'title': n.get('display_title') or n.get('displayTitle') or n.get('title') or '',
                                 'type': n.get('type') or 'normal',
-                                'likes': n.get('interact_info', {}).get('liked_count') or
-                                         n.get('interactInfo', {}).get('likedCount') or '0',
-                                'status': n.get('note_status') or n.get('noteStatus') or '',
+                                'likes': str(likes) if likes else '0',
+                                'views': str(n.get('view_count') or '0'),
+                                'comments': str(n.get('comments_count') or '0'),
+                                'collects': str(n.get('collected_count') or '0'),
+                                'xsec_token': xsec,
+                                'status': status_label,
                                 'time': n.get('last_update_time') or n.get('lastUpdateTime') or '',
                             })
             except Exception:
@@ -2262,9 +2414,11 @@ async def get_my_notes(limit: int = 50) -> str:
         result = f"已发布笔记（共 {len(notes)} 条）：\n\n"
         for i, n in enumerate(notes, 1):
             url = f"https://www.xiaohongshu.com/explore/{n['id']}"
+            if n.get('xsec_token'):
+                url += f"?xsec_token={n['xsec_token']}&xsec_source=pc_user"
             result += (
-                f"{i}. 【{n['title'] or '无标题'}】  {n['type']}\n"
-                f"   ❤️{n['likes']}  状态: {n['status']}\n"
+                f"{i}. 【{n['title'] or '无标题'}】  {n['type']}  {n['status']}\n"
+                f"   ❤️{n['likes']}  💬{n['comments']}  ⭐{n['collects']}  👁{n['views']}\n"
                 f"   {url}\n\n"
             )
         return result
@@ -2676,7 +2830,11 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
 @mcp.tool()
 async def delete_note(note_id: str) -> str:
     """删除指定笔记。note_id 从 get_my_notes 返回的链接中获取（URL 最后一段）。"""
-    await ensure_browser()
+    login_status = await ensure_browser()
+    if not login_status:
+        return "请先登录小红书账号"
+    if not browser_context:
+        return "浏览器上下文未初始化"
     page = await browser_context.new_page()
     await Stealth().apply_stealth_async(page)
 
@@ -2810,7 +2968,11 @@ async def publish_note(
               "auto"      - 有 image_paths 用 upload，否则用 text_card
         card_text: text_card 模式下卡片显示的文字（留空则自动用标题+正文前100字）
     """
-    await ensure_browser()
+    login_status = await ensure_browser()
+    if not login_status:
+        return "请先登录小红书账号"
+    if not browser_context:
+        return "浏览器上下文未初始化"
 
     # 决定实际模式
     valid_paths = [p for p in image_paths if os.path.exists(p)]
@@ -2985,7 +3147,19 @@ async def publish_note(
 
 
 if __name__ == "__main__":
-    # 初始化并运行服务器
-    print("启动小红书MCP服务器...")
-    print("请在MCP客户端（如Claude for Desktop）中配置此服务器")
-    mcp.run(transport='stdio')
+    import sys
+    transport = "stdio"
+    host = "127.0.0.1"
+    port = 8765
+    for i, arg in enumerate(sys.argv[1:], 1):
+        if arg == "--http":
+            transport = "streamable-http"
+        elif arg.startswith("--port="):
+            port = int(arg.split("=")[1])
+        elif arg == "--port" and i + 1 < len(sys.argv):
+            port = int(sys.argv[i + 1])
+    if transport == "streamable-http":
+        print(f"启动 HTTP 模式，监听 {host}:{port}/mcp")
+        mcp.run(transport="streamable-http", host=host, port=port)
+    else:
+        mcp.run(transport="stdio")
