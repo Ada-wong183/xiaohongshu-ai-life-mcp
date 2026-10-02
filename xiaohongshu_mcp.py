@@ -1,3 +1,4 @@
+import sys
 from typing import Any, List, Dict, Optional
 import asyncio
 import json
@@ -377,8 +378,8 @@ def _record_comment(action_type: str, note_id: str, comment_id: str = '', conten
         )
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[comment_history] 写入失败 {action_type} note={note_id} cid={comment_id}: {e}", file=sys.stderr, flush=True)
 
 
 def _get_comment_history(note_id: str = '', action_type: str = None, comment_id: str = None) -> list:
@@ -412,6 +413,86 @@ main_page = None
 notifications_page = None  # 通知标签页，常驻不关闭
 is_logged_in = False
 _user_token_cache: dict = {}  # {hex_id: xsec_token}，search_user 自动填充
+_note_token_cache: dict = {}  # {note_id: xsec_token}，通知/搜索/feed/打开笔记时自动填充
+
+
+def _remember_note_token(note_id: str, token: str):
+    if note_id and token:
+        _note_token_cache[note_id] = token
+
+
+def _remember_token_from_url(url: str):
+    """从 URL 里解析 note_id 和 xsec_token 并缓存。"""
+    import re as _re
+    m = _re.search(r'/(?:explore|discovery/item)/([0-9a-f]{24})', url or '')
+    t = _re.search(r'xsec_token=([^&#]+)', url or '')
+    if m and t:
+        _remember_note_token(m.group(1), t.group(1))
+
+
+def _add_cached_token(url: str) -> str:
+    """explore 链接没带 xsec_token 时，用缓存补上（缓存里没有就原样返回）。"""
+    import re as _re
+    if 'xsec_token=' in url:
+        return url
+    m = _re.search(r'xiaohongshu\.com/(?:explore|discovery/item)/([0-9a-f]{24})', url)
+    if m and m.group(1) in _note_token_cache:
+        sep = '&' if '?' in url else '?'
+        return f"{url}{sep}xsec_token={_note_token_cache[m.group(1)]}&xsec_source=pc_feed"
+    return url
+
+
+_EXPAND_REPLY_RE = "text=/展开\\s*\\d*\\s*条回复|展开更多回复|查看更多回复/"
+
+
+async def _expand_replies(page, rounds: int = 6) -> int:
+    """点开所有折叠的楼中楼（"展开 N 条回复"）。返回点击次数。"""
+    clicked = 0
+    for _ in range(rounds):
+        btns = page.locator(_EXPAND_REPLY_RE)
+        try:
+            n = await btns.count()
+        except Exception:
+            break
+        if n == 0:
+            break
+        progressed = False
+        for i in range(n):
+            try:
+                b = btns.nth(i)
+                await b.scroll_into_view_if_needed(timeout=2000)
+                await b.click(timeout=2000)
+                clicked += 1
+                progressed = True
+                await asyncio.sleep(0.8)
+            except Exception:
+                continue
+        if not progressed:
+            break
+    return clicked
+
+
+_EXTRACT_COMMENTS_JS = """() => {
+    const clean = t => (t || '').replace(/\\s+/g, ' ').trim();
+    const read = (el) => {
+        const id = (el.id || '').replace(/^comment-/, '');
+        const name = clean(el.querySelector('.author .name, .author-wrapper .name, .name')?.innerText
+                         || el.querySelector('a[href*="/user/profile/"]')?.innerText);
+        const isAuthor = !!el.querySelector('.tag, .author-tag') && /作者/.test(el.innerText.slice(0, 80));
+        const content = clean(el.querySelector('.content, .note-text')?.innerText);
+        const time = clean(el.querySelector('.date, .time')?.innerText);
+        return { id, user: name, content, time, is_author: isAuthor };
+    };
+    const out = [];
+    document.querySelectorAll('.parent-comment').forEach(pc => {
+        const top = pc.querySelector(':scope > .comment-item, .comment-item:not(.comment-item-sub)');
+        if (!top) return;
+        const item = read(top);
+        item.replies = [...pc.querySelectorAll('.comment-item-sub')].map(read);
+        out.push(item);
+    });
+    return out;
+}"""
 
 
 def process_url(url: str) -> str:
@@ -488,17 +569,39 @@ async def ensure_browser():
     global browser_instance, browser_obj, browser_context, main_page, is_logged_in
 
     global notifications_page
-    # 健康检查：连接已断开时自动重置
+    # 健康检查：Chrome 被手动关掉 / CDP 断开时自动重置
+    # 注意：browser_context.pages 是本地缓存，Chrome 关了也不报错，必须看 is_connected() 和 CDP 端口
     if browser_context is not None:
+        _dead = False
         try:
-            _ = browser_context.pages
+            if browser_obj is not None and not browser_obj.is_connected():
+                _dead = True
+            elif not _cdp_alive():
+                _dead = True
         except Exception:
+            _dead = True
+        if _dead:
+            try:
+                if browser_instance is not None:
+                    await browser_instance.stop()
+            except Exception:
+                pass
             browser_instance = None
             browser_obj = None
             browser_context = None
             main_page = None
             notifications_page = None
             is_logged_in = False
+
+    # main_page 标签页被单独关掉：换一个可用页面
+    if browser_context is not None and (main_page is None or main_page.is_closed()):
+        _open = [pg for pg in browser_context.pages if not pg.is_closed()]
+        main_page = _open[0] if _open else await browser_context.new_page()
+        main_page.set_default_timeout(60000)
+        is_logged_in = False
+
+    if notifications_page is not None and notifications_page.is_closed():
+        notifications_page = None
 
     if browser_context is None:
         await _ensure_chrome_running()
@@ -642,6 +745,7 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
                     user = note_card.get('user') or {}
                     interact = note_card.get('interactInfo') or note_card.get('interact_info') or {}
                     cover = note_card.get('cover') or {}
+                    _remember_note_token(item_id, item.get('xsec_token') or item.get('xsecToken') or '')
                     unique_items[item_id] = {
                         'id': item_id,
                         'xsecToken': item.get('xsec_token') or item.get('xsecToken') or '',
@@ -1335,12 +1439,13 @@ async def get_note_comments(url: str) -> str:
         
     try:
         # 处理URL
-        processed_url = process_url(url)
+        processed_url = _add_cached_token(process_url(url))
         print(f"处理后的评论URL: {processed_url}")
         
         # 访问帖子链接
         await main_page.goto(processed_url, timeout=60000)
         await asyncio.sleep(5)  # 等待页面加载
+        _remember_token_from_url(main_page.url)
         
         # 检查是否加载了错误页面
         if not main_page:  # 添加空检查
@@ -1436,7 +1541,34 @@ async def get_note_comments(url: str) -> str:
         if not main_page:
             return "浏览器初始化失败，请重试"
 
-        # ── 优先从 __INITIAL_STATE__ 提取（速度快且有完整 comment_id）────
+        # ── 展开所有楼中楼，按层级提取（一级评论 + 其下回复）─────────────
+        try:
+            await _expand_replies(main_page)
+            await _rand_sleep(1)
+            threads = await main_page.evaluate(_EXTRACT_COMMENTS_JS)
+        except Exception as e:
+            print(f"层级提取评论出错: {e}")
+            threads = []
+        if threads:
+            import re as _re
+            _m = _re.search(r'/explore/([0-9a-f]{24})', main_page.url)
+            _nid = _m.group(1) if _m else ''
+            _tk = _note_token_cache.get(_nid, '')
+            _total = sum(1 + len(t['replies']) for t in threads)
+            result = f"笔记 note_id: {_nid}"
+            if _tk:
+                result += f"  xsec_token: {_tk}"
+            result += f"\n共 {len(threads)} 条一级评论、{_total - len(threads)} 条楼中楼：\n\n"
+            for i, t in enumerate(threads, 1):
+                au = "[作者]" if t['is_author'] else ""
+                result += f"{i}. {t['user']}{au}（{t['time']}）: {t['content']}  [comment_id: {t['id']}]\n"
+                for r in t['replies']:
+                    au = "[作者]" if r['is_author'] else ""
+                    result += f"    ↳ {r['user']}{au}（{r['time']}）: {r['content']}  [comment_id: {r['id']}]\n"
+                result += "\n"
+            return result
+
+        # ── 降级：从 __INITIAL_STATE__ 提取（速度快且有完整 comment_id）────
         try:
             state_comments = await main_page.evaluate("""() => {
                 const state = window.__INITIAL_STATE__;
@@ -1569,7 +1701,7 @@ async def get_note_comments(url: str) -> str:
         return f"获取评论时出错: {str(e)}"
 
 @mcp.tool()
-async def post_comment(url: str, comment: str) -> str:
+async def post_comment(url: str, comment: str, force: bool = False) -> str:
     """发布评论到指定笔记。
     支持 @mention：
     - @昵称          → picker 昵称匹配（适合唯一昵称）
@@ -1577,8 +1709,9 @@ async def post_comment(url: str, comment: str) -> str:
       hexid 从 get_user_notes/search_notes 等工具的 URL 末段获取
 
     Args:
-        url: 笔记 URL
+        url: 笔记 URL（支持短链）
         comment: 评论内容，支持 @昵称 或 @昵称:hexid 格式
+        force: 该笔记已评论过时默认拦截并提醒；确实要再评论一次时传 true
     """
     _rl = _RateLimit.check('comment')
     if _rl:
@@ -1610,24 +1743,28 @@ async def post_comment(url: str, comment: str) -> str:
         processed_url = process_url(url)
         print(f"处理后的评论URL: {processed_url}")
 
-        # 从 URL 提取 note_id（/explore/xxx?... → xxx）
-        _note_id_match = re.search(r'/explore/([^/?#]+)', processed_url)
-        _note_id = _note_id_match.group(1) if _note_id_match else ''
+        # 访问帖子链接（短链会跳转，所以 note_id 必须在跳转后从最终 URL 取）
+        await main_page.goto(processed_url, timeout=60000)
+        await asyncio.sleep(5)  # 等待页面加载
+        _remember_token_from_url(main_page.url)
 
-        # 查历史，有则在结果前插入提示
+        _note_id_match = re.search(r'/(?:explore|discovery/item)/([0-9a-f]{24})', main_page.url) \
+            or re.search(r'/explore/([^/?#]+)', processed_url)
+        _note_id = _note_id_match.group(1) if _note_id_match else ''
+        if not _note_id:
+            print(f"[comment_history] 无法解析 note_id: {processed_url} -> {main_page.url}", file=sys.stderr, flush=True)
+
+        # 查历史：已评论过则拦截，除非 force=True
         _history_prefix = ''
         if _note_id:
             _prev = _get_comment_history(_note_id, action_type='commented')
             if _prev:
-                _lines = []
-                for _h in _prev:
-                    _lines.append(f"  · {_h['created_at']}  「{_h['content']}」")
-                _history_prefix = "⚠️ 你已在该笔记下评论过：\n" + "\n".join(_lines) + "\n本次仍已发送。\n\n"
+                _lines = [f"  · {_h['created_at']}  「{_h['content'][:60]}{'…' if len(_h['content']) > 60 else ''}」" for _h in _prev]
+                _msg = "你已在该笔记下评论过：\n" + "\n".join(_lines)
+                if not force:
+                    return f"⚠️ {_msg}\n未发送。确实要再评论一次，请传 force=true。"
+                _history_prefix = f"⚠️ {_msg}\n（force=true，本次仍已发送）\n\n"
 
-        # 访问帖子链接
-        await main_page.goto(processed_url, timeout=60000)
-        await asyncio.sleep(5)  # 等待页面加载
-        
         # 检查是否加载了错误页面
         if not main_page:  # 添加空检查
             return "浏览器初始化失败，请重试"
@@ -1821,10 +1958,13 @@ async def post_comment(url: str, comment: str) -> str:
                 print(f"使用JavaScript点击发送按钮出错: {str(e)}")
         
         if send_success:
+            _warn = ''
             if _note_id:
                 _record_comment('commented', _note_id, content=comment)
+            else:
+                _warn = "\n⚠️ 未能解析笔记 ID，这条评论没有写入历史，请用 add_comment_history 手动补录。"
             _RateLimit.record('comment')
-            return f"{_history_prefix}已成功发布评论：{comment}"
+            return f"{_history_prefix}已成功发布评论：{comment}{_warn}"
         else:
             return f"发布评论失败，请检查评论内容或网络连接"
 
@@ -2052,7 +2192,13 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
             note = msg.get('item_info') or {}
             note_content = note.get('content') or note.get('display_title') or note.get('displayTitle') or ''
             note_id = note.get('id', '')
+            note_token = note.get('xsec_token', '')
+            _remember_note_token(note_id, note_token)
             note_url = f"https://www.xiaohongshu.com/explore/{note_id}" if note_id else ''
+            if note_url and note_token:
+                note_url += f"?xsec_token={note_token}&xsec_source=pc_notice"
+            this_cid = comment_info.get('id', '')
+            target_cid = (comment_info.get('target_comment') or {}).get('id', '')
 
             line = f"{i}. **{nickname}**"
             if indicator:
@@ -2066,6 +2212,14 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
                 line += f"\n   📝 笔记：{note_content[:50]}{'…' if len(note_content) > 50 else ''}"
             if note_url:
                 line += f"\n   🔗 {note_url}"
+            if note_id:
+                line += f"\n   🆔 note_id: {note_id}"
+                if note_token:
+                    line += f"  xsec_token: {note_token}"
+            if this_cid:
+                line += f"\n   💬 comment_id（可直接 reply_comment 回复这条）: {this_cid}"
+            if target_cid:
+                line += f"\n   ↩️ 对方回复的是你的评论 comment_id: {target_cid}"
             result += line + "\n\n"
 
         return result
@@ -2422,6 +2576,7 @@ async def list_feeds(limit: int = 20, verbose: bool = False) -> str:
             note_card = item.get('noteCard') or item.get('note_card') or {}
             user = note_card.get('user') or {}
             interact = note_card.get('interactInfo') or note_card.get('interact_info') or {}
+            _remember_note_token(item.get('id', ''), item.get('xsec_token') or item.get('xsecToken') or '')
             items.append({
                 'id': item.get('id', ''),
                 'xsecToken': item.get('xsec_token') or item.get('xsecToken') or '',
@@ -2590,6 +2745,7 @@ async def _navigate_note(note_id: str, xsec_token: str = "") -> tuple:
     page.set_default_timeout(30000)
 
     url = f"https://www.xiaohongshu.com/explore/{note_id}"
+    xsec_token = xsec_token or _note_token_cache.get(note_id, '')
     if xsec_token:
         url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
     await page.goto(url, timeout=30000)
@@ -2712,34 +2868,36 @@ async def favorite_note(note_id: str, xsec_token: str = "", unfavorite: bool = F
 
 
 @mcp.tool()
-async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token: str = "") -> str:
+async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token: str = "", force: bool = False) -> str:
     """回复笔记下的某条评论。
 
     Args:
         note_id: 笔记 ID
         comment_id: 要回复的评论 ID（从 get_note_comments 获取）
         content: 回复内容
-        xsec_token: 笔记的 xsec_token
+        xsec_token: 笔记的 xsec_token（可留空，会用缓存）
+        force: 该评论已回复过时默认拦截并提醒；确实要再回一次时传 true
     """
     _rl = _RateLimit.check('reply')
     if _rl:
         return _rl
 
-    page, err = await _navigate_note(note_id, xsec_token)
-    if err:
-        return err
-
-    # 查历史回复记录
+    # 查历史回复记录：已回复过则拦截，除非 force=True（在开页面之前查，省一次导航）
     _reply_history_prefix = ''
     try:
         _prev_replies = _get_comment_history(note_id, action_type='replied', comment_id=comment_id)
         if _prev_replies:
-            _lines = []
-            for _h in _prev_replies:
-                _lines.append(f"  · {_h['created_at']}  「{_h['content']}」")
-            _reply_history_prefix = "⚠️ 你已回复过该评论：\n" + "\n".join(_lines) + "\n本次仍已发送。\n\n"
-    except Exception:
-        pass
+            _lines = [f"  · {_h['created_at']}  「{_h['content'][:60]}{'…' if len(_h['content']) > 60 else ''}」" for _h in _prev_replies]
+            _msg = "你已回复过该评论：\n" + "\n".join(_lines)
+            if not force:
+                return f"⚠️ {_msg}\n未发送。确实要再回一次，请传 force=true。"
+            _reply_history_prefix = f"⚠️ {_msg}\n（force=true，本次仍已发送）\n\n"
+    except Exception as e:
+        print(f"[comment_history] 查询回复历史失败: {e}", file=sys.stderr, flush=True)
+
+    page, err = await _navigate_note(note_id, xsec_token)
+    if err:
+        return err
 
     try:
         await _rand_sleep(2)  # 等评论区加载
@@ -2747,10 +2905,15 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
         # 找目标评论，支持滚动
         selector = f"#comment-{comment_id}"
         comment_el = None
-        for _ in range(30):
+        for _i in range(30):
             comment_el = await page.query_selector(selector)
             if comment_el:
                 break
+            if _i % 3 == 2:
+                await _expand_replies(page, rounds=1)  # 楼中楼默认折叠，展开后才能定位
+                comment_el = await page.query_selector(selector)
+                if comment_el:
+                    break
             await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
             await _rand_sleep(0.8)
 
@@ -2795,6 +2958,24 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
     finally:
         await asyncio.sleep(_random.uniform(0.5, 1.2))
         await page.close()
+
+
+@mcp.tool()
+async def add_comment_history(note_id: str, content: str, action_type: str = "commented", comment_id: str = "") -> str:
+    """手动补录一条评论/回复历史（漏记时用）。
+
+    Args:
+        note_id: 笔记 ID
+        content: 评论/回复内容
+        action_type: commented（一级评论）或 replied（回复某条评论，需填 comment_id 为被回复的评论 ID）
+        comment_id: replied 时必填；commented 时可填自己那条评论的 ID
+    """
+    if action_type not in ("commented", "replied"):
+        return "action_type 只能是 commented 或 replied"
+    if action_type == "replied" and not comment_id:
+        return "replied 需要填被回复的 comment_id"
+    _record_comment(action_type, note_id, comment_id=comment_id, content=content)
+    return f"已补录：[{action_type}] 笔记 {note_id} {('→ 评论 ' + comment_id) if comment_id else ''}"
 
 
 @mcp.tool()
@@ -2847,10 +3028,15 @@ async def like_comment(note_id: str, comment_id: str, xsec_token: str = "", unli
 
         selector = f"#comment-{comment_id}"
         comment_el = None
-        for _ in range(30):
+        for _i in range(30):
             comment_el = await page.query_selector(selector)
             if comment_el:
                 break
+            if _i % 3 == 2:
+                await _expand_replies(page, rounds=1)  # 楼中楼默认折叠，展开后才能定位
+                comment_el = await page.query_selector(selector)
+                if comment_el:
+                    break
             await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
             await _rand_sleep(0.8)
 
