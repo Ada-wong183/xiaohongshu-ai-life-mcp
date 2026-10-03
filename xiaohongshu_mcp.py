@@ -71,36 +71,189 @@ def _analyze_images_with_gemini(image_paths: list, note_title: str = "") -> str:
 import random as _random
 
 
-class _RateLimit:
-    """内存速率限制器，防止高频操作触发风控。"""
-    _limits = {
-        'comment': {'min_interval': 120, 'max_per_hour': 5},
-        'reply':   {'min_interval': 120, 'max_per_hour': 5},
-        'like':    {'min_interval': 30,  'max_per_hour': 20},
-        'search':  {'min_interval': 10,  'max_per_hour': 30},
-    }
-    _history: dict = {}
+class _RiskBlocked(Exception):
+    """触发风控熔断时抛出，工具层会把消息原样返回。"""
 
+
+_RISK_URL_KEYS = ('website-login/captcha', '/captcha', 'verifytype=', 'web-login/captcha', '/website-login/error')
+_RISK_TITLE_KEYS = ('安全限制', '安全验证', '验证码', '访问频繁', '账号异常')
+_RISK_TEXT_KEYS = ('操作频繁', '访问频繁', '安全验证', '账号存在异常', '账号异常', '请完成验证', '拖动滑块')
+
+
+def _rl_db():
+    conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "xhs_actions.db"), timeout=10)
+    conn.execute("CREATE TABLE IF NOT EXISTS rate_events (action_type TEXT NOT NULL, ts REAL NOT NULL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_events ON rate_events(action_type, ts)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS risk_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        until_ts REAL, reason TEXT, tripped_at REAL, trip_count INTEGER DEFAULT 0)""")
+    return conn
+
+
+class _RateLimit:
+    """持久化速率限制 + 风控熔断。记录存在 xhs_actions.db，服务重启不清零。
+    max_per_hour 为 None 表示只限间隔、不限次数。"""
+    _limits = {
+        'comment':     {'min_interval': 120, 'max_per_hour': None},
+        'reply':       {'min_interval': 120, 'max_per_hour': None},
+        'like':        {'min_interval': 30,  'max_per_hour': 20},
+        'search':      {'min_interval': 10,  'max_per_hour': 30},
+        'image_fetch': {'min_interval': 8,   'max_per_hour': 60},
+    }
+
+    # ── 熔断 ──
+    @classmethod
+    def breaker_message(cls):
+        """熔断中返回提示字符串，否则 None。"""
+        try:
+            with _rl_db() as conn:
+                row = conn.execute("SELECT until_ts, reason FROM risk_state WHERE id=1").fetchone()
+        except Exception as e:
+            print(f"[risk] 读熔断状态失败: {e}", file=sys.stderr, flush=True)
+            return None
+        if row and row[0] and row[0] > _time.time():
+            until = datetime.fromtimestamp(row[0]).strftime('%m-%d %H:%M')
+            return f"🛑 小红书风控熔断中，暂停所有操作到 {until}。触发原因：{row[1]}。如已手动在浏览器里过了验证，可用 risk_status(clear=True) 解除。"
+        return None
+
+    @classmethod
+    def trip(cls, reason: str):
+        """触发熔断：24h 内第一次停 6 小时，24h 内再次触发停 24 小时。"""
+        now = _time.time()
+        try:
+            with _rl_db() as conn:
+                row = conn.execute("SELECT until_ts, tripped_at, trip_count FROM risk_state WHERE id=1").fetchone()
+                if row and row[0] and row[0] > now:
+                    return  # 已在熔断中，不重复推送
+                repeat = bool(row and row[1] and now - row[1] < 24 * 3600)
+                hours = 24 if repeat else 6
+                count = (row[2] or 0) + 1 if row else 1
+                conn.execute("INSERT OR REPLACE INTO risk_state (id, until_ts, reason, tripped_at, trip_count) VALUES (1, ?, ?, ?, ?)",
+                             (now + hours * 3600, reason, now, count))
+        except Exception as e:
+            print(f"[risk] 写熔断状态失败: {e}", file=sys.stderr, flush=True)
+            hours = 6
+        print(f"[risk] 🛑 熔断 {hours}h：{reason}", file=sys.stderr, flush=True)
+
+    @classmethod
+    def clear(cls):
+        with _rl_db() as conn:
+            conn.execute("UPDATE risk_state SET until_ts = NULL WHERE id=1")
+
+    # ── 限速 ──
     @classmethod
     def check(cls, action_type: str):
         """返回 None 表示允许，返回字符串表示拒绝原因（应直接 return 给调用方）。"""
+        b = cls.breaker_message()
+        if b:
+            return b
         cfg = cls._limits.get(action_type)
         if not cfg:
             return None
         now = _time.time()
-        history = [t for t in cls._history.get(action_type, []) if now - t < 3600]
-        cls._history[action_type] = history
+        try:
+            with _rl_db() as conn:
+                conn.execute("DELETE FROM rate_events WHERE ts < ?", (now - 7 * 86400,))
+                history = [r[0] for r in conn.execute(
+                    "SELECT ts FROM rate_events WHERE action_type=? AND ts > ? ORDER BY ts",
+                    (action_type, now - 3600))]
+        except Exception as e:
+            print(f"[ratelimit] 读记录失败: {e}", file=sys.stderr, flush=True)
+            return None
         if history and (now - history[-1]) < cfg['min_interval']:
             wait = int(cfg['min_interval'] - (now - history[-1]))
             return f"⏳ 操作过于频繁，请等待约 {wait} 秒后再操作。（防风控：{action_type} 最短间隔 {cfg['min_interval']}s）"
-        if len(history) >= cfg['max_per_hour']:
+        if cfg['max_per_hour'] and len(history) >= cfg['max_per_hour']:
             wait = int(3600 - (now - history[0]))
             return f"⏳ 本小时 {action_type} 次数已达上限（{cfg['max_per_hour']} 次），请等待约 {wait} 秒后再试。"
         return None
 
     @classmethod
     def record(cls, action_type: str):
-        cls._history.setdefault(action_type, []).append(_time.time())
+        try:
+            with _rl_db() as conn:
+                conn.execute("INSERT INTO rate_events (action_type, ts) VALUES (?, ?)", (action_type, _time.time()))
+        except Exception as e:
+            print(f"[ratelimit] 写记录失败: {e}", file=sys.stderr, flush=True)
+
+
+def _url_is_risky(url: str) -> bool:
+    u = (url or '').lower()
+    return any(k in u for k in _RISK_URL_KEYS)
+
+
+async def _detect_risk(page):
+    """检查页面是否落入风控（验证码页 / 安全限制 / 频繁提示 toast）。命中返回原因字符串。
+    正文关键词只在短页面或 toast/弹窗里查，避免笔记内容本身提到"验证"之类误判。"""
+    try:
+        if page.is_closed():
+            return None
+        if _url_is_risky(page.url):
+            return f"跳转到验证页 {page.url[:120]}"
+        title = await page.title()
+        for k in _RISK_TITLE_KEYS:
+            if k in title:
+                return f"页面标题「{title}」"
+        hit = await page.evaluate("""(keys) => {
+            const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+            const cap = [...document.querySelectorAll('[class*="captcha" i], [id*="captcha" i], .red-captcha')].find(vis);
+            if (cap) return '页面出现验证码组件';
+            const pools = [...document.querySelectorAll('[class*="toast" i], [class*="message" i][role], [role="alert"]')]
+                .filter(vis).map(e => (e.innerText || '').slice(0, 200));
+            const body = (document.body && document.body.innerText) || '';
+            if (body.length < 600) pools.push(body);
+            for (const t of pools) for (const k of keys) if (t.includes(k)) return '提示：' + t.trim().slice(0, 60);
+            return null;
+        }""", list(_RISK_TEXT_KEYS))
+        return hit
+    except Exception:
+        return None
+
+
+def _arm_page(page):
+    """给 page 装上风控守卫：goto 前查熔断，goto 后查风控；任何主框架跳到验证页也会触发熔断。幂等。"""
+    if page is None or getattr(page, '_risk_armed', False):
+        return
+    _orig_goto = page.goto
+
+    async def _guarded_goto(url, *args, **kwargs):
+        b = _RateLimit.breaker_message()
+        if b:
+            raise _RiskBlocked(b)
+        resp = await _orig_goto(url, *args, **kwargs)
+        reason = await _detect_risk(page)
+        if reason:
+            _RateLimit.trip(reason)
+            raise _RiskBlocked(f"🛑 检测到风控（{reason}），已熔断并暂停所有小红书操作。")
+        return resp
+
+    def _on_nav(frame):
+        try:
+            if frame == page.main_frame and _url_is_risky(frame.url):
+                _RateLimit.trip(f"跳转到验证页 {frame.url[:120]}")
+        except Exception:
+            pass
+
+    page.goto = _guarded_goto
+    page.on("framenavigated", _on_nav)
+    page._risk_armed = True
+
+
+async def _skim(page):
+    """打开笔记后先看一会儿：随机滚两三下再回来，避免"一打开就评论"。"""
+    try:
+        vp = page.viewport_size or {'width': 1280, 'height': 800}
+        await page.mouse.move(vp['width'] * _random.uniform(0.35, 0.6), vp['height'] * _random.uniform(0.35, 0.6),
+                              steps=_random.randint(6, 14))
+        await _rand_sleep(_random.uniform(3, 6))
+        for _ in range(_random.randint(2, 3)):
+            await page.mouse.wheel(0, _random.randint(200, 550))
+            await _rand_sleep(_random.uniform(1.5, 4))
+        if _random.random() < 0.6:
+            await page.mouse.wheel(0, -_random.randint(150, 400))
+            await _rand_sleep(_random.uniform(1, 2.5))
+    except Exception:
+        pass
 
 
 async def _human_click(page, element=None, x: float = None, y: float = None):
@@ -138,17 +291,53 @@ async def _rand_sleep(base: float, jitter: float = 0.4):
     delta = base * jitter
     await asyncio.sleep(max(0.1, base + _random.uniform(-delta, delta)))
 
-async def _human_type(page, text: str, wpm: int = 180):
-    """逐字输入，模拟人类打字节奏（默认约 180 字/分钟）。
-    遇到标点或换行时额外停顿，模拟思考节奏。
-    """
-    base_delay = 60.0 / (wpm * 5)  # 每字符平均间隔（秒）
-    for char in text:
-        await page.keyboard.type(char)
-        if char in ('。', '，', '！', '？', '、', '\n', '.', ',', '!', '?'):
-            await asyncio.sleep(_random.uniform(0.15, 0.45))
+_CJK_RE = re.compile(r'[㐀-鿿豈-﫿]')
+
+
+async def _human_type(page, text: str, wpm: int = None):
+    """模拟真人输入中文。
+    - 汉字按 1~4 字一组用 insert_text 上屏（像输入法选词提交），每组之间 0.5~1.5 秒，约 2~3 字/秒
+    - 英文/数字/符号逐键敲，换行按 Enter
+    - 偶尔停下来"想一想"
+    - 超过 200 字的长文按段落上屏（像从草稿粘贴过来），避免一篇笔记敲十几分钟
+    wpm 参数保留只为兼容旧调用，已不使用。"""
+    if len(text) > 200:
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            if line:
+                await page.keyboard.insert_text(line)
+                await asyncio.sleep(_random.uniform(0.8, 2.5))
+            if i < len(lines) - 1:
+                await page.keyboard.press('Enter')
+                await asyncio.sleep(_random.uniform(0.2, 0.6))
+        return
+
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '\n':
+            await page.keyboard.press('Enter')
+            await asyncio.sleep(_random.uniform(0.5, 1.2))
+            i += 1
+        elif _CJK_RE.match(ch):
+            j = i + 1
+            target = _random.choice((1, 2, 2, 2, 3, 3, 4))
+            while j < n and j - i < target and _CJK_RE.match(text[j]):
+                j += 1
+            await page.keyboard.insert_text(text[i:j])
+            await asyncio.sleep(_random.uniform(0.5, 1.5))
+            i = j
+        elif ch in '。，！？、；：…“”‘’（）《》～—':
+            await page.keyboard.insert_text(ch)
+            await asyncio.sleep(_random.uniform(0.4, 1.0))
+            i += 1
         else:
-            await asyncio.sleep(_random.uniform(base_delay * 0.5, base_delay * 2.0))
+            await page.keyboard.type(ch)
+            await asyncio.sleep(_random.uniform(0.08, 0.25) if ch not in '.,!?' else _random.uniform(0.3, 0.7))
+            i += 1
+        if _random.random() < 0.06:
+            await asyncio.sleep(_random.uniform(1.5, 3.5))
 
 async def _get_user_avatar_key(page, user_hex_id: str) -> str:
     """导航到用户主页，提取其头像 CDN key（用于 picker 精确匹配）。"""
@@ -413,11 +602,56 @@ main_page = None
 notifications_page = None  # 通知标签页，常驻不关闭
 is_logged_in = False
 _user_token_cache: dict = {}  # {hex_id: xsec_token}，search_user 自动填充
-_note_token_cache: dict = {}  # {note_id: xsec_token}，通知/搜索/feed/打开笔记时自动填充
+class _PersistentTokenCache(dict):
+    """{note_id: xsec_token}，内存 + xhs_actions.db 双份，服务重启不丢。"""
+    def _db(self):
+        conn = sqlite3.connect(ACTIONS_DB, timeout=10)
+        conn.execute("CREATE TABLE IF NOT EXISTS note_tokens (note_id TEXT PRIMARY KEY, token TEXT, updated_at REAL)")
+        return conn
+
+    def _load(self, key):
+        try:
+            with self._db() as c:
+                r = c.execute("SELECT token FROM note_tokens WHERE note_id=?", (key,)).fetchone()
+            if r and r[0]:
+                dict.__setitem__(self, key, r[0])
+                return r[0]
+        except Exception as e:
+            print(f"[token_cache] 读失败: {e}", file=sys.stderr, flush=True)
+        return None
+
+    def __setitem__(self, key, value):
+        dict.__setitem__(self, key, value)
+        try:
+            with self._db() as c:
+                c.execute("INSERT OR REPLACE INTO note_tokens (note_id, token, updated_at) VALUES (?, ?, ?)",
+                          (key, value, _time.time()))
+        except Exception as e:
+            print(f"[token_cache] 写失败: {e}", file=sys.stderr, flush=True)
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or self._load(key) is not None
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        v = self._load(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+_note_token_cache = _PersistentTokenCache()  # 通知/搜索/feed/打开笔记时自动填充
 
 
 def _remember_note_token(note_id: str, token: str):
-    if note_id and token:
+    if note_id and token and dict.get(_note_token_cache, note_id) != token:
         _note_token_cache[note_id] = token
 
 
@@ -616,6 +850,9 @@ async def ensure_browser():
         else:
             browser_context = await browser_obj.new_context()
 
+        # 风控守卫：之后新开的每个标签页都自动装上
+        browser_context.on("page", _arm_page)
+
         # 注入 attachShadow 拦截器，使 closed shadow root 也可被访问
         await browser_context.add_init_script("""
             window.__shadowRoots = new WeakMap();
@@ -634,6 +871,14 @@ async def ensure_browser():
 
         main_page.set_default_timeout(60000)
 
+    # 已有标签页补装风控守卫（幂等）
+    if browser_context is not None:
+        for _pg in browser_context.pages:
+            _arm_page(_pg)
+    _b = _RateLimit.breaker_message()
+    if _b:
+        raise _RiskBlocked(_b)
+
     # 检查登录状态
     if not is_logged_in:
         if main_page:
@@ -646,11 +891,32 @@ async def ensure_browser():
                 else:
                     is_logged_in = True
                     return True
+            except _RiskBlocked:
+                raise
             except Exception:
                 return False
         return False
 
     return True
+
+@mcp.tool()
+def risk_status(clear: bool = False) -> str:
+    """查看小红书风控熔断状态。clear=True 时解除熔断（仅在已于浏览器里手动通过验证后使用）。"""
+    if clear:
+        _RateLimit.clear()
+        return "✅ 已解除风控熔断。建议先慢一点，过一阵再评论/点赞。"
+    msg = _RateLimit.breaker_message()
+    if msg:
+        return msg
+    try:
+        with _rl_db() as conn:
+            row = conn.execute("SELECT reason, tripped_at, trip_count FROM risk_state WHERE id=1").fetchone()
+    except Exception:
+        row = None
+    if row and row[1]:
+        return f"🟢 当前未熔断。上次触发：{datetime.fromtimestamp(row[1]).strftime('%m-%d %H:%M')}（{row[0]}），累计 {row[2]} 次。"
+    return "🟢 当前未熔断，从未触发过。"
+
 
 @mcp.tool()
 async def login() -> str:
@@ -1747,6 +2013,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
         await main_page.goto(processed_url, timeout=60000)
         await asyncio.sleep(5)  # 等待页面加载
         _remember_token_from_url(main_page.url)
+        await _skim(main_page)  # 先看一会儿再评论
 
         _note_id_match = re.search(r'/(?:explore|discovery/item)/([0-9a-f]{24})', main_page.url) \
             or re.search(r'/explore/([^/?#]+)', processed_url)
@@ -1959,6 +2226,10 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
         
         if send_success:
             _warn = ''
+            _risk = await _detect_risk(main_page)
+            if _risk:
+                _RateLimit.trip(_risk)
+                return f"🛑 发送后检测到风控（{_risk}），已熔断。评论可能没发出去，请到浏览器里确认。"
             if _note_id:
                 _record_comment('commented', _note_id, content=comment)
             else:
@@ -1982,6 +2253,11 @@ def get_note_images(url: str) -> dict:
     Returns:
         dict: 包含笔记基本信息和本地图片路径列表
     """
+    _rl = _RateLimit.check('image_fetch')
+    if _rl:
+        return {"error": _rl}
+    _RateLimit.record('image_fetch')
+
     # 手机 UA，不用这个拿不到 __INITIAL_STATE__
     headers = {
         "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
@@ -2092,12 +2368,16 @@ def get_note_images(url: str) -> dict:
 
 
 @mcp.tool()
-async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
+async def get_notifications(tab: str = "comments", limit: int = 20, only_unreplied: bool = False, verbose: bool = False) -> str:
     """获取小红书通知（评论@、赞和收藏、新增关注）
+    评论通知会自动对照回复记录，回过的标"✅ 已回复"。想省 token 时用 only_unreplied=True 只看没回的。
 
     Args:
         tab: 通知类型，可选 "comments"（评论和@）、"likes"（赞和收藏）、"follows"（新增关注）。默认 "comments"。
         limit: 最多返回条数，默认 20。
+        only_unreplied: 只返回还没回复过的评论通知（仅 comments 有效），默认 False。
+        verbose: 评论通知默认用精简格式（按笔记分组、不带链接和 token，回复/点赞时 token 会自动补）；
+            True 时输出带链接、token、被回复评论 ID 的完整格式。
     """
     login_status = await ensure_browser()
     if not login_status:
@@ -2175,7 +2455,60 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
             return f"暂无{tab_label}通知"
 
         msgs = msgs[:limit]
-        result = f"📬 {tab_label}通知（{len(msgs)} 条{'，还有更多' if has_more else ''}）：\n\n"
+
+        # 自动对照回复记录：comment_id -> 回复时间
+        _replied = {}
+        try:
+            _c = sqlite3.connect(ACTIONS_DB)
+            for _cid, _at in _c.execute("SELECT comment_id, created_at FROM comment_history WHERE action_type='replied' AND comment_id IS NOT NULL AND comment_id != ''"):
+                _replied[_cid] = str(_at)[:16].replace('T', ' ')
+            _c.close()
+        except Exception as e:
+            print(f"[notifications] 读回复记录失败: {e}", file=sys.stderr, flush=True)
+        _cid_of = lambda m: (m.get('comment_info') or {}).get('id', '')
+        _n_replied = sum(1 for m in msgs if _cid_of(m) in _replied) if tab == "comments" else 0
+        if tab == "comments" and only_unreplied:
+            msgs = [m for m in msgs if _cid_of(m) not in _replied]
+            if not msgs:
+                return f"📬 {tab_label}通知：最近 {_n_replied} 条都已回复过，没有待回的。"
+
+        result = f"📬 {tab_label}通知（{len(msgs)} 条{'，还有更多' if has_more else ''}"
+        if tab == "comments":
+            result += f"，已回复 {_n_replied} 条" if not only_unreplied else f"，只显示未回复的，另有 {_n_replied} 条已回复"
+        result += "）：\n\n"
+
+        if tab == "comments" and not verbose:
+            groups = {}  # note_id -> {'title':..., 'items': [...]}
+            for msg in msgs:
+                note = msg.get('item_info') or {}
+                nid = note.get('id', '')
+                _remember_note_token(nid, note.get('xsec_token', ''))
+                g = groups.setdefault(nid, {'title': (note.get('content') or note.get('display_title') or note.get('displayTitle') or '')[:20], 'items': []})
+                g['items'].append(msg)
+            out = [result.rstrip('\n').rstrip('：') + "（回复/点赞时 xsec_token 会自动补，不用传）"]
+            for nid, g in groups.items():
+                out.append(f"\n📝 {g['title'] or '（无标题）'}  note_id: {nid or '?'}")
+                for msg in g['items']:
+                    nick = (msg.get('user_info') or {}).get('nickname', '?')
+                    ci = msg.get('comment_info') or {}
+                    text = ci.get('content') or ci.get('note_text') or ci.get('text') or ''
+                    cid = ci.get('id', '')
+                    act = msg.get('title', '')
+                    ts = msg.get('time', 0)
+                    try:
+                        t = datetime.fromtimestamp(int(ts)).strftime('%m-%d %H:%M') if ts else ''
+                    except Exception:
+                        t = ''
+                    if cid in _replied:
+                        short = text[:20] + ('…' if len(text) > 20 else '')
+                        out.append(f"  ✅ {nick}：{short}")
+                    else:
+                        kind = '@' if '@' in act or '提到' in act else ''
+                        line = f"  💬 {nick}{kind} {t}：{text}"
+                        if cid:
+                            line += f"\n     comment_id: {cid}"
+                        out.append(line)
+            return "\n".join(out)
 
         for i, msg in enumerate(msgs, 1):
             user = msg.get('user_info', {})
@@ -2216,7 +2549,9 @@ async def get_notifications(tab: str = "comments", limit: int = 20) -> str:
                 line += f"\n   🆔 note_id: {note_id}"
                 if note_token:
                     line += f"  xsec_token: {note_token}"
-            if this_cid:
+            if this_cid and this_cid in _replied:
+                line += f"\n   ✅ 已回复（{_replied[this_cid]}），comment_id: {this_cid}"
+            elif this_cid:
                 line += f"\n   💬 comment_id（可直接 reply_comment 回复这条）: {this_cid}"
             if target_cid:
                 line += f"\n   ↩️ 对方回复的是你的评论 comment_id: {target_cid}"
@@ -2900,7 +3235,7 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
         return err
 
     try:
-        await _rand_sleep(2)  # 等评论区加载
+        await _rand_sleep(_random.uniform(3, 6))  # 等评论区加载，顺便"读一会儿"
 
         # 找目标评论，支持滚动
         selector = f"#comment-{comment_id}"
@@ -2949,6 +3284,10 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
             return "找不到提交按钮"
         await _human_click(page, submit_btn)
         await _rand_sleep(1.5)
+        _risk = await _detect_risk(page)
+        if _risk:
+            _RateLimit.trip(_risk)
+            return f"🛑 提交后检测到风控（{_risk}），已熔断。回复可能没发出去，请到浏览器里确认。"
         _record_comment('replied', note_id, comment_id=comment_id, content=content)
         _RateLimit.record('reply')
         return f"{_reply_history_prefix}✅ 回复成功"

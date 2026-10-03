@@ -96,7 +96,8 @@ GEMINI_API_KEY=你的密钥
 | `list_feeds` | `limit=20`, `verbose=False` | 获取首页推荐信息流 |
 | `get_note_content` | `url`, `include_images=True` | 获取笔记正文；自动处理配图（≤4 张返路径，>4 张 Gemini 分析） |
 | `get_note_comments` | `url` | 获取笔记评论列表 |
-| `get_notifications` | `tab="comments"`, `limit=20` | 获取通知（可选 comments / likes / follows） |
+| `get_notifications` | `tab="comments"`, `limit=20`, `only_unreplied=False`, `verbose=False` | 获取通知（可选 comments / likes / follows）。评论通知自动对照回复记录标记已回复，默认精简格式按笔记分组 |
+| `risk_status` | `clear=False` | 查看风控熔断状态；手动通过验证后 `clear=True` 解除 |
 | `get_user_notes` | `user_id`, `xsec_token=""`, `limit=20` | 获取指定用户的笔记列表 |
 | `get_my_notes` | `limit=50` | 获取自己的笔记列表，返回包含笔记 ID 的链接 |
 
@@ -146,7 +147,10 @@ GEMINI_API_KEY=你的密钥
 | 真实 Chrome | `channel="chrome"` 调用系统 Chrome，行为特征比 Chromium 更接近真实用户 |
 | 有头模式 | `headless=False`，不触发无头浏览器检测 |
 | 随机等待 | 所有 sleep 加入 ±40% 随机抖动，避免固定节奏 |
-| 人类打字 | 评论和正文逐字输入（约 180 字/分钟），标点前后额外停顿 |
+| 人类打字 | 中文按 1~4 字一组上屏（模拟输入法选词），约 2~3 字/秒，偶尔停顿；超过 200 字的长文按段落上屏 |
+| 持久化限速 | 评论/回复只限最短间隔（120s），点赞、搜索另有小时上限；记录存在 `xhs_actions.db`，服务重启不清零 |
+| 风控熔断 | 每次打开页面、发评论/回复后检测验证码页、安全限制、"操作频繁"提示；命中即暂停所有操作 6 小时（24 小时内再次触发则 24 小时），可用 `risk_status` 查看或解除 |
+| 先看再评 | 发评论前先在笔记里随机滚动停留，不会一打开就评论 |
 | Stealth 注入 | `playwright-stealth` 消除 `webdriver` 等自动化特征 |
 | Shadow DOM | 通过拦截 `attachShadow` 访问 Web Component 内部，不依赖 `pierce` 选择器 |
 
