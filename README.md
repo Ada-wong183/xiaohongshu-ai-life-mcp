@@ -98,6 +98,7 @@ GEMINI_API_KEY=你的密钥
 | `get_note_comments` | `url` | 获取笔记评论列表 |
 | `get_notifications` | `tab="comments"`, `limit=20`, `only_unreplied=False`, `verbose=False` | 获取通知（可选 comments / likes / follows）。评论通知自动对照回复记录标记已回复，默认精简格式按笔记分组 |
 | `risk_status` | `clear=False` | 查看风控熔断状态；手动通过验证后 `clear=True` 解除 |
+| `follow_user` | `user_id`, `xsec_token=""` | 关注用户：先在对方主页浏览一会儿再点关注，已关注的不重复点（间隔 60s，每小时最多 10 个） |
 | `get_user_notes` | `user_id`, `xsec_token=""`, `limit=20` | 获取指定用户的笔记列表 |
 | `get_my_notes` | `limit=50` | 获取自己的笔记列表，返回包含笔记 ID 的链接 |
 
@@ -151,10 +152,34 @@ GEMINI_API_KEY=你的密钥
 | 持久化限速 | 评论/回复只限最短间隔（120s），点赞、搜索另有小时上限；记录存在 `xhs_actions.db`，服务重启不清零 |
 | 风控熔断 | 每次打开页面、发评论/回复后检测验证码页、安全限制、"操作频繁"提示；命中即暂停所有操作 6 小时（24 小时内再次触发则 24 小时），可用 `risk_status` 查看或解除 |
 | 先看再评 | 发评论前先在笔记里随机滚动停留，不会一打开就评论 |
+| 通知页回复 | 回复别人回我的评论时，优先在通知页直接点"回复"（和真人路径一致）；通知里找不到才打开笔记页 |
+| 闲逛养号 | 后台每隔 1.5~5 小时（9:00~23:00）随机刷首页、点开 1~3 篇看看，不点赞不评论、不经过 LLM；有工具调用立刻让路。`XHS_IDLE=0` 关闭 |
 | Stealth 注入 | `playwright-stealth` 消除 `webdriver` 等自动化特征 |
 | Shadow DOM | 通过拦截 `attachShadow` 访问 Web Component 内部，不依赖 `pierce` 选择器 |
 
 > **切换无头模式：** 如果在无显示器的服务器环境运行，可将 `xiaohongshu_mcp.py` 中两处 `headless=False` 改为 `headless=True`。无头模式更易被风控检测，建议仅在有头模式无法使用时才切换。
+
+---
+
+## 通知看门狗
+
+不用让 AI 定时去查通知（省 token）：服务在后台被动监听小红书页面自带的未读数轮询，有新的评论/@/关注时打开通知页取详情，把新内容写进唤醒日志（默认 `~/xhs-wake-events.log`，每行一条 JSON：`tag` / `message` / `reason` / `ts`）。AI 客户端盯着这个文件即可被叫醒，例如 Claude Code 里用 Monitor 执行 `tail -n 0 -F ~/xhs-wake-events.log`。
+
+- **普通通知**：攒着，在 `XHS_WATCH_HOURS`（默认 8-23）内每 30~60 分钟合并写一次
+- **关联号**（`XHS_PRIORITY_USERS`）的评论/@：立刻写，顺带带出攒着的
+- 首次运行只把现有通知记为已见，不叫醒；已推送、已回复、自己用 `get_notifications` 看过的都不会重复叫醒
+- 消息里自带 note_id、comment_id 和"回的是哪句"，AI 可以直接 `reply_comment`
+
+配置写在项目目录的 `.env`（参考 `.env.example`）：
+
+| 变量 | 说明 |
+|------|------|
+| `XHS_MY_NICK` | 自己的昵称，通知里被回复的评论是自己的就显示"我" |
+| `XHS_PRIORITY_USERS` | 关联号 user_id 或昵称，逗号分隔 |
+| `XHS_WATCH` | `0` 关闭看门狗 |
+| `XHS_WAKE_LOG` | 唤醒日志路径 |
+| `XHS_WATCH_HOURS` | 普通通知叫醒时段，如 `8-23` |
+| `XHS_IDLE` | `0` 关闭闲逛养号 |
 
 ---
 

@@ -8,6 +8,25 @@ import base64
 import tempfile
 import sqlite3
 import time as _time
+
+
+def _load_dotenv():
+    """读取同目录 .env（KEY=VALUE，# 注释），不覆盖已有环境变量。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv()
+from contextlib import asynccontextmanager as _asynccontextmanager
 import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
@@ -99,6 +118,7 @@ class _RateLimit:
         'like':        {'min_interval': 30,  'max_per_hour': 20},
         'search':      {'min_interval': 10,  'max_per_hour': 30},
         'image_fetch': {'min_interval': 8,   'max_per_hour': 60},
+        'follow':      {'min_interval': 60,  'max_per_hour': 10},
     }
 
     # ── 熔断 ──
@@ -519,7 +539,7 @@ async def _quick_comments(page, limit: int = 15) -> str:
 
 
 # 初始化 FastMCP 服务器
-mcp = FastMCP("xiaohongshu_scraper")
+mcp = FastMCP("xiaohongshu_scraper", lifespan=lambda server: _lifespan(server))
 
 # 全局变量
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -797,10 +817,14 @@ async def _ensure_chrome_running():
     raise RuntimeError("Chrome 启动超时，请手动确认 Chrome 是否可以运行")
 
 
-async def ensure_browser():
+async def ensure_browser(_from_idle: bool = False):
     """确保浏览器已连接（CDP 模式连接真实 Chrome）。
     若连接已断开则自动重连，无需手动重启 MCP。"""
     global browser_instance, browser_obj, browser_context, main_page, is_logged_in
+    global _last_tool_ts, _idle_abort
+    if not _from_idle:
+        _last_tool_ts = _time.time()
+        _idle_abort = True  # 有正经操作进来，正在闲逛的话马上收手
 
     global notifications_page
     # 健康检查：Chrome 被手动关掉 / CDP 断开时自动重置
@@ -852,6 +876,7 @@ async def ensure_browser():
 
         # 风控守卫：之后新开的每个标签页都自动装上
         browser_context.on("page", _arm_page)
+        browser_context.on("response", _watch_on_response)
 
         # 注入 attachShadow 拦截器，使 closed shadow root 也可被访问
         await browser_context.add_init_script("""
@@ -898,6 +923,340 @@ async def ensure_browser():
         return False
 
     return True
+
+# ── 通知看门狗 ────────────────────────────────────────────────────────────
+# 小红书页面自己每 ~30 秒轮询一次 unread_count，这里只被动监听，不额外请求。
+# 发现新的评论/@/关注 → 打开通知页取详情 → 新内容写进唤醒日志（JSON 一行一条，格式同花园唤醒桥）。
+#   普通通知：攒着，每 30~60 分钟（只在 XHS_WATCH_HOURS 时段内）合并写一次
+#   关联号（XHS_PRIORITY_USERS）的评论/@：立刻写，顺带把攒着的一起写出
+# 环境变量：XHS_WATCH=0 关闭；XHS_WAKE_LOG 日志路径；XHS_PRIORITY_USERS 关联号 user_id 或昵称，逗号分隔；
+#           XHS_WATCH_HOURS 普通通知的叫醒时段，默认 8-23
+XHS_WATCH_ON = os.environ.get("XHS_WATCH", "1") != "0"
+XHS_WAKE_LOG = os.path.expanduser(os.environ.get("XHS_WAKE_LOG", "~/xhs-wake-events.log"))
+XHS_PRIORITY = {x.strip() for x in os.environ.get("XHS_PRIORITY_USERS", "").split(",") if x.strip()}
+try:
+    _wh = os.environ.get("XHS_WATCH_HOURS", "8-23").split("-")
+    XHS_WATCH_HOURS = (int(_wh[0]), int(_wh[1]))
+except Exception:
+    XHS_WATCH_HOURS = (8, 23)
+_WATCH_FETCH_GAP_DAY = 10 * 60     # 白天两次打开通知页至少隔 10 分钟
+_WATCH_FETCH_GAP_NIGHT = 30 * 60   # 夜里至少隔 30 分钟
+_watch_pending: list = []
+_watch_last_fetch = 0.0
+_watch_fetch_scheduled = False
+_watch_started = False
+
+
+def _watch_in_hours() -> bool:
+    return XHS_WATCH_HOURS[0] <= datetime.now().hour < XHS_WATCH_HOURS[1]
+
+
+def _watch_db():
+    conn = sqlite3.connect(ACTIONS_DB, timeout=10)
+    conn.execute("CREATE TABLE IF NOT EXISTS notif_seen (msg_id TEXT PRIMARY KEY, seen_at REAL)")
+    return conn
+
+
+def _wake_write(tag: str, message: str, reason: str):
+    try:
+        with open(XHS_WAKE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"tag": tag, "message": message, "reason": reason,
+                                "ts": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.000Z')}, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[watch] 写唤醒日志失败: {e}", file=sys.stderr, flush=True)
+
+
+def _watch_flush(priority_lines=None):
+    """把攒着的普通通知（和关联号通知）一次写出去。"""
+    global _watch_pending
+    lines = list(priority_lines or []) + _watch_pending
+    if not lines:
+        return
+    _watch_pending = []
+    tag = "📕 小红书·关联号" if priority_lines else "📕 小红书通知"
+    reason = "xhs_priority_mention" if priority_lines else "xhs_notifications"
+    _wake_write(tag, f"小红书有 {len(lines)} 条新通知：\n" + "\n".join(lines) +
+                "\n（回复用 reply_comment(note_id, comment_id, content)，token 自动补；关注用 follow_user）", reason)
+    print(f"[watch] 已写唤醒日志：{len(lines)} 条", file=sys.stderr, flush=True)
+
+
+def _watch_process(kind: str, msgs: list):
+    """处理通知接口返回的 message_list。kind: mentions / connections。任何地方打开通知页都会经过这里，
+    所以我自己用 get_notifications 看过的，也会被记为已见、不再叫醒。"""
+    if not XHS_WATCH_ON or not msgs:
+        return
+    try:
+        with _watch_db() as conn:
+            # 每种通知各自做首次基线（id 加 kind 前缀），避免先看到关注、后看到评论时把旧评论全当新的
+            first_run = conn.execute("SELECT COUNT(*) FROM notif_seen WHERE msg_id LIKE ?", (f"{kind}:%",)).fetchone()[0] == 0
+            keys = [f"{kind}:{m.get('id', '')}" for m in msgs]
+            seen = {r[0] for r in conn.execute(
+                f"SELECT msg_id FROM notif_seen WHERE msg_id IN ({','.join('?' * len(keys))})", keys)}
+            new = [m for m in msgs if m.get('id') and f"{kind}:{m['id']}" not in seen]
+            conn.executemany("INSERT OR IGNORE INTO notif_seen (msg_id, seen_at) VALUES (?, ?)",
+                             [(f"{kind}:{m['id']}", _time.time()) for m in new])
+            replied = {r[0] for r in conn.execute(
+                "SELECT comment_id FROM comment_history WHERE action_type='replied' AND comment_id IS NOT NULL")}
+    except Exception as e:
+        print(f"[watch] 读写已见记录失败: {e}", file=sys.stderr, flush=True)
+        return
+    if first_run:
+        print(f"[watch] 首次运行，{len(new)} 条旧通知记为已见，不叫醒", file=sys.stderr, flush=True)
+        return
+    prio, normal = [], []
+    for m in reversed(new):  # 旧的在前
+        u = m.get('user_info') or m.get('user') or {}
+        uid, nick = u.get('userid', '') or u.get('user_id', ''), u.get('nickname', '?')
+        is_prio = uid in XHS_PRIORITY or nick in XHS_PRIORITY
+        if kind == 'connections':
+            line = f"➕ {nick} 关注了你（user_id: {uid}）"
+            normal.append(line)
+            continue
+        ci = m.get('comment_info') or {}
+        cid = ci.get('id', '')
+        if cid and cid in replied:
+            continue
+        note = m.get('item_info') or {}
+        nid = note.get('id', '')
+        _remember_note_token(nid, note.get('xsec_token', ''))
+        ntitle = (note.get('content') or note.get('display_title') or '')[:20]
+        text = (ci.get('content') or '').replace('\n', ' ')
+        line = f"💬 {nick} {m.get('title', '')}《{ntitle}》：{text}"
+        tgt = ((ci.get('target_comment') or {}).get('content') or '').replace('\n', ' ')
+        if tgt:
+            line += f"\n   ↪ 回的是：{tgt[:60]}{'…' if len(tgt) > 60 else ''}"
+        line += f"\n   note_id: {nid}  comment_id: {cid}"
+        (prio if is_prio else normal).append(("⚡" + line) if is_prio else line)
+    _watch_pending.extend(normal)
+    if prio:
+        _watch_flush(prio)
+
+
+async def _watch_fetch(delay: float = 0, include_follows: bool = True):
+    """开一个临时标签页看通知（评论@ + 新增关注），由 response 监听器负责处理数据。"""
+    global _watch_last_fetch, _watch_fetch_scheduled
+    try:
+        if delay:
+            await asyncio.sleep(delay)
+        if _RateLimit.breaker_message() or not browser_context:
+            return
+        _watch_last_fetch = _time.time()
+        page = await browser_context.new_page()
+        page.set_default_timeout(30000)
+        try:
+            await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
+            await asyncio.sleep(_random.uniform(3, 6))
+            if include_follows:
+                tab = page.locator('text="新增关注"').first
+                if await tab.count():
+                    await _human_click(page, await tab.element_handle())
+                    await asyncio.sleep(_random.uniform(2, 4))
+        finally:
+            await asyncio.sleep(_random.uniform(0.5, 1.5))
+            await page.close()
+    except _RiskBlocked:
+        pass
+    except Exception as e:
+        print(f"[watch] 看通知出错：{e}", file=sys.stderr, flush=True)
+    finally:
+        _watch_fetch_scheduled = False
+
+
+async def _watch_on_response(resp):
+    """挂在 browser_context 上的 response 监听器。"""
+    global _watch_fetch_scheduled
+    url = resp.url
+    if 'xiaohongshu.com' not in url:
+        return
+    try:
+        if '/api/sns/web/unread_count' in url:
+            d = ((await resp.json()) or {}).get('data') or {}
+            if not (d.get('mentions') or d.get('connections')) or _watch_fetch_scheduled:
+                return
+            gap = _WATCH_FETCH_GAP_DAY if _watch_in_hours() else _WATCH_FETCH_GAP_NIGHT
+            if _time.time() - _watch_last_fetch < gap:
+                return
+            _watch_fetch_scheduled = True
+            # 像人一样：看到小红点过一会儿才点开
+            asyncio.get_running_loop().create_task(
+                _watch_fetch(delay=_random.uniform(40, 180), include_follows=bool(d.get('connections'))))
+        elif '/you/mentions' in url:
+            _watch_process('mentions', (((await resp.json()) or {}).get('data') or {}).get('message_list') or [])
+        elif '/you/connections' in url:
+            _watch_process('connections', (((await resp.json()) or {}).get('data') or {}).get('message_list') or [])
+    except Exception:
+        pass
+
+
+async def _watch_loop():
+    """兜底巡查：每 30~60 分钟看一次通知并把攒着的写出去（只在 XHS_WATCH_HOURS 时段内）。
+    顺带保证浏览器开着，这样页面自己的 unread_count 轮询才能跑起来。"""
+    await asyncio.sleep(_random.uniform(2, 6) * 60)
+    while True:
+        try:
+            if _watch_in_hours() and not _RateLimit.breaker_message():
+                if await ensure_browser(_from_idle=True):
+                    if _time.time() - _watch_last_fetch > _WATCH_FETCH_GAP_DAY:
+                        await _watch_fetch()
+                    _watch_flush()
+        except _RiskBlocked:
+            pass
+        except Exception as e:
+            print(f"[watch] 巡查出错：{e}", file=sys.stderr, flush=True)
+        await asyncio.sleep(_random.uniform(30, 60) * 60)
+
+
+# ── 闲逛（养号）：后台定时随机刷首页、点开几篇看看，不经过 LLM，不点赞不评论 ──────
+IDLE_HOURS = (9, 23)            # 只在 9:00~23:00 之间闲逛
+IDLE_GAP_HOURS = (1.5, 5.0)     # 两次闲逛之间隔 1.5~5 小时（随机），一天大约 3~5 次
+IDLE_QUIET_AFTER_TOOL = 15 * 60 # 工具刚用过 15 分钟内不闲逛
+_last_tool_ts = 0.0
+_idle_abort = False
+_idle_started = False
+
+
+def _idle_should_stop() -> bool:
+    return _idle_abort or bool(_RateLimit.breaker_message())
+
+
+async def _idle_session():
+    global _idle_abort
+    _idle_abort = False
+    ok = await ensure_browser(_from_idle=True)
+    if not ok or not browser_context:
+        print("[idle] 浏览器未就绪或未登录，跳过本次闲逛", file=sys.stderr, flush=True)
+        return
+    page = await browser_context.new_page()
+    page.set_default_timeout(30000)
+    opened = 0
+    target_open = _random.randint(1, 3)
+    try:
+        await page.goto("https://www.xiaohongshu.com/explore", timeout=30000)
+        await _rand_sleep(_random.uniform(3, 6))
+        for _ in range(_random.randint(4, 9)):
+            if _idle_should_stop():
+                break
+            vp = page.viewport_size or {'width': 1280, 'height': 800}
+            await page.mouse.move(vp['width'] * _random.uniform(0.2, 0.8), vp['height'] * _random.uniform(0.3, 0.7),
+                                  steps=_random.randint(5, 12))
+            await page.mouse.wheel(0, _random.randint(300, 900))
+            await asyncio.sleep(_random.uniform(2, 7))
+            if opened >= target_open or _random.random() > 0.45:
+                continue
+            # 在当前视口里随便挑一张卡片点开
+            idxs = await page.evaluate("""() => [...document.querySelectorAll('section.note-item a.cover')]
+                .map((a, i) => { const r = a.getBoundingClientRect(); return (r.top > 60 && r.bottom < innerHeight - 20) ? i : -1; })
+                .filter(i => i >= 0)""")
+            if not idxs:
+                continue
+            card = await page.locator('section.note-item a.cover').nth(_random.choice(idxs)).element_handle()
+            await _human_click(page, card)
+            await asyncio.sleep(_random.uniform(3, 6))
+            for _ in range(_random.randint(1, 4)):  # 在笔记里看看图文和评论
+                if _idle_should_stop():
+                    break
+                await page.mouse.wheel(0, _random.randint(150, 500))
+                await asyncio.sleep(_random.uniform(2, 6))
+            await asyncio.sleep(_random.uniform(4, 20))
+            await page.keyboard.press('Escape')
+            await asyncio.sleep(_random.uniform(1.5, 3.5))
+            if '/explore/' in page.url:  # 万一不是弹窗而是整页跳转
+                await page.go_back()
+                await asyncio.sleep(_random.uniform(2, 4))
+            opened += 1
+        print(f"[idle] 闲逛结束：点开 {opened} 篇{'（被打断）' if _idle_abort else ''}", file=sys.stderr, flush=True)
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+async def _idle_loop():
+    await asyncio.sleep(_random.uniform(10, 30) * 60)  # 服务启动后先等一阵
+    while True:
+        try:
+            hour = datetime.now().hour
+            quiet = _time.time() - _last_tool_ts < IDLE_QUIET_AFTER_TOOL
+            if IDLE_HOURS[0] <= hour < IDLE_HOURS[1] and not quiet and not _RateLimit.breaker_message():
+                await _idle_session()
+            else:
+                print(f"[idle] 跳过（{'时段外' if not (IDLE_HOURS[0] <= hour < IDLE_HOURS[1]) else '刚用过工具' if quiet else '熔断中'}）",
+                      file=sys.stderr, flush=True)
+        except _RiskBlocked:
+            pass
+        except Exception as e:
+            print(f"[idle] 闲逛出错：{e}", file=sys.stderr, flush=True)
+        await asyncio.sleep(_random.uniform(*IDLE_GAP_HOURS) * 3600)
+
+
+@_asynccontextmanager
+async def _lifespan(server):
+    global _idle_started
+    if not _idle_started and os.environ.get("XHS_IDLE", "1") != "0":
+        _idle_started = True
+        asyncio.get_running_loop().create_task(_idle_loop())
+        print("[idle] 闲逛任务已启动", file=sys.stderr, flush=True)
+    global _watch_started
+    if not _watch_started and XHS_WATCH_ON:
+        _watch_started = True
+        asyncio.get_running_loop().create_task(_watch_loop())
+        print(f"[watch] 通知看门狗已启动，日志 {XHS_WAKE_LOG}，关联号 {len(XHS_PRIORITY)} 个", file=sys.stderr, flush=True)
+    yield
+
+
+@mcp.tool()
+async def follow_user(user_id: str, xsec_token: str = "") -> str:
+    """关注一个用户。会先在对方主页看一会儿笔记再点关注，已关注的不会重复点。
+
+    Args:
+        user_id: 用户 hex ID（如 63a6d4e70000000026007f5e，来自 search_user / 通知 / 笔记作者）
+        xsec_token: 用户主页的 xsec_token，可留空（search_user 查过的会自动用缓存）
+    """
+    _rl = _RateLimit.check('follow')
+    if _rl:
+        return _rl
+    if not await ensure_browser():
+        return "请先登录小红书账号"
+    token = xsec_token or _user_token_cache.get(user_id, '')
+    url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
+    if token:
+        url += f"?xsec_token={token}&xsec_source=pc_note"
+    page = await browser_context.new_page()
+    page.set_default_timeout(30000)
+    try:
+        await page.goto(url, timeout=30000, referer="https://www.xiaohongshu.com/explore")
+        await asyncio.sleep(_random.uniform(3, 5))
+        nick = await page.evaluate("() => (document.querySelector('.user-nickname, [class*=\"user-name\"]')||{}).innerText || ''")
+        # 先看看对方的笔记，再回到顶部点关注
+        for _ in range(_random.randint(1, 3)):
+            await page.mouse.wheel(0, _random.randint(300, 700))
+            await asyncio.sleep(_random.uniform(2, 5))
+        await page.mouse.wheel(0, -3000)
+        await asyncio.sleep(_random.uniform(1.5, 3))
+
+        btn = page.locator('button.follow-button').first
+        if not await btn.count():
+            return f"找不到关注按钮（{nick or user_id}），可能是自己的主页或页面没加载出来"
+        state = (await btn.inner_text()).strip()
+        if '已关注' in state or '互相关注' in state:
+            return f"已经关注过 {nick or user_id} 了（{state}）"
+        await _human_click(page, await btn.element_handle())
+        await _rand_sleep(2)
+        risk = await _detect_risk(page)
+        if risk:
+            _RateLimit.trip(risk)
+            return f"🛑 点关注后检测到风控（{risk}），已熔断。请到浏览器确认是否关注成功。"
+        after = (await btn.inner_text()).strip()
+        if '已关注' in after or '互相关注' in after:
+            _RateLimit.record('follow')
+            _record_comment('followed', user_id, content=nick)
+            return f"✅ 已关注 {nick or user_id}（{after}）"
+        return f"⚠️ 点了关注，但按钮还是「{after}」，请到浏览器确认"
+    finally:
+        await asyncio.sleep(_random.uniform(0.5, 1.5))
+        await page.close()
+
 
 @mcp.tool()
 def risk_status(clear: bool = False) -> str:
@@ -2010,7 +2369,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
         print(f"处理后的评论URL: {processed_url}")
 
         # 访问帖子链接（短链会跳转，所以 note_id 必须在跳转后从最终 URL 取）
-        await main_page.goto(processed_url, timeout=60000)
+        await main_page.goto(processed_url, timeout=60000, referer="https://www.xiaohongshu.com/explore")
         await asyncio.sleep(5)  # 等待页面加载
         _remember_token_from_url(main_page.url)
         await _skim(main_page)  # 先看一会儿再评论
@@ -2486,6 +2845,7 @@ async def get_notifications(tab: str = "comments", limit: int = 20, only_unrepli
                 g = groups.setdefault(nid, {'title': (note.get('content') or note.get('display_title') or note.get('displayTitle') or '')[:20], 'items': []})
                 g['items'].append(msg)
             out = [result.rstrip('\n').rstrip('：') + "（回复/点赞时 xsec_token 会自动补，不用传）"]
+            _my_nick = os.environ.get('XHS_MY_NICK', '')  # 被回复的评论若是自己的，显示"我"
             for nid, g in groups.items():
                 out.append(f"\n📝 {g['title'] or '（无标题）'}  note_id: {nid or '?'}")
                 for msg in g['items']:
@@ -2505,13 +2865,19 @@ async def get_notifications(tab: str = "comments", limit: int = 20, only_unrepli
                     else:
                         kind = '@' if '@' in act or '提到' in act else ''
                         line = f"  💬 {nick}{kind} {t}：{text}"
+                        _tgt = (ci.get('target_comment') or {})
+                        _tgt_text = (_tgt.get('content') or '').replace('\n', ' ')
+                        if _tgt_text:
+                            _who = (_tgt.get('user_info') or {}).get('nickname', '')
+                            _who = '我' if _who == (_my_nick or _who) else _who
+                            line += f"\n     ↪ 回的是{_who}：{_tgt_text[:60]}{'…' if len(_tgt_text) > 60 else ''}"
                         if cid:
                             line += f"\n     comment_id: {cid}"
                         out.append(line)
             return "\n".join(out)
 
         for i, msg in enumerate(msgs, 1):
-            user = msg.get('user_info', {})
+            user = msg.get('user_info') or msg.get('user') or {}
             nickname = user.get('nickname', '未知用户')
             indicator = user.get('indicator', '')  # "作者"/"粉丝" 等身份标注
             title = msg.get('title', '')           # 动作描述，如"回复了你的评论"
@@ -2695,7 +3061,7 @@ async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) ->
     """获取指定用户主页的笔记列表。
 
     Args:
-        user_id: 小红书号（纯数字，自动搜索）或用户 hex ID（如 612ad9c20000000001003aa3）。
+        user_id: 小红书号（纯数字，自动搜索）或用户 hex ID（如 5f1a2b3c0000000001000abc）。
         xsec_token: 一般不需要传，传小红书号时自动获取，传 hex ID 时从缓存取。
         limit: 最多返回笔记数，默认 20
     """
@@ -3083,7 +3449,7 @@ async def _navigate_note(note_id: str, xsec_token: str = "") -> tuple:
     xsec_token = xsec_token or _note_token_cache.get(note_id, '')
     if xsec_token:
         url += f"?xsec_token={xsec_token}&xsec_source=pc_feed"
-    await page.goto(url, timeout=30000)
+    await page.goto(url, timeout=30000, referer="https://www.xiaohongshu.com/explore")
 
     title = await page.title()
     if "安全限制" in title:
@@ -3202,6 +3568,88 @@ async def favorite_note(note_id: str, xsec_token: str = "", unfavorite: bool = F
         await page.close()
 
 
+async def _reply_via_notification(comment_id: str, content: str):
+    """在通知页直接回复（真人最常见的回复路径）。
+    返回 (handled, msg)：handled=False 表示通知里没找到这条/没能打开回复框，什么都没发，调用方可走原路径。"""
+    global notifications_page
+    if notifications_page is None or notifications_page.is_closed():
+        notifications_page = await browser_context.new_page()
+        notifications_page.set_default_timeout(30000)
+    page = notifications_page
+    cap = {}
+
+    async def on_resp(r):
+        if '/you/mentions' in r.url:
+            try:
+                cap['d'] = await r.json()
+            except Exception:
+                pass
+
+    page.on('response', on_resp)
+    try:
+        await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
+        await _rand_sleep(3)
+    finally:
+        page.remove_listener('response', on_resp)
+
+    msgs = ((cap.get('d') or {}).get('data') or {}).get('message_list') or []
+    ids = [(m.get('comment_info') or {}).get('id', '') for m in msgs]
+    if comment_id not in ids:
+        return False, ''
+    idx = ids.index(comment_id)
+    items = page.locator('.tabs-content-container > .container')
+    if await items.count() <= idx:
+        return False, ''
+    item = items.nth(idx)
+
+    # 核对 DOM 这一条确实是目标评论（表情会渲染成图片，所以去掉 [xxR] 后比前 6 个字）
+    def _norm(t):
+        return re.sub(r'\[[^\]]{1,8}\]|\s', '', t or '')[:6]
+    expected = _norm((msgs[idx].get('comment_info') or {}).get('content', ''))
+    try:
+        actual = _norm(await item.locator('.interaction-content').inner_text(timeout=3000))
+    except Exception:
+        actual = ''
+    if expected and actual and expected != actual:
+        print(f"[notif_reply] DOM 与接口对不上：{expected} vs {actual}，改走笔记页", file=sys.stderr, flush=True)
+        return False, ''
+
+    await item.scroll_into_view_if_needed()
+    await asyncio.sleep(_random.uniform(2, 5))  # 先读一下这条通知
+    btn = await item.locator('.action-reply').element_handle(timeout=5000)
+    await _human_click(page, btn)
+    await _rand_sleep(1.2)
+    try:
+        ta = await item.locator('textarea.comment-input').element_handle(timeout=5000)
+    except Exception:
+        return False, ''
+    await _human_click(page, ta)
+    await _rand_sleep(0.5)
+    await _human_type(page, content)
+    await asyncio.sleep(_random.uniform(0.8, 2.0))
+
+    # ── 以下点了发送，出任何问题都不能再走原路径，否则会重复发 ──
+    try:
+        sub = await item.locator('button.submit').element_handle(timeout=3000)
+        await _human_click(page, sub)
+        await _rand_sleep(2)
+        risk = await _detect_risk(page)
+        if risk:
+            _RateLimit.trip(risk)
+            return True, f"🛑 提交后检测到风控（{risk}），已熔断。回复可能没发出去，请到浏览器里确认。"
+        left = ''
+        try:
+            if await item.locator('textarea.comment-input').count():
+                left = await item.locator('textarea.comment-input').input_value(timeout=1000)
+        except Exception:
+            pass
+        if left.strip():
+            return True, "⚠️ 点了发送但输入框里还有内容，可能没发出去，请到浏览器确认（未自动重试，避免重复）。"
+        return True, "✅ 回复成功（通知页直接回复）"
+    except Exception as e:
+        return True, f"⚠️ 发送过程中出错：{e}。可能已发出，请到浏览器确认（未自动重试，避免重复）。"
+
+
 @mcp.tool()
 async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token: str = "", force: bool = False) -> str:
     """回复笔记下的某条评论。
@@ -3229,6 +3677,22 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
             _reply_history_prefix = f"⚠️ {_msg}\n（force=true，本次仍已发送）\n\n"
     except Exception as e:
         print(f"[comment_history] 查询回复历史失败: {e}", file=sys.stderr, flush=True)
+
+    # 优先在通知页直接回复（别人回我的评论都在通知里），找不到再打开笔记页
+    if not await ensure_browser():
+        return "请先登录小红书账号"
+    try:
+        _handled, _msg = await _reply_via_notification(comment_id, content)
+    except _RiskBlocked:
+        raise
+    except Exception as e:
+        print(f"[notif_reply] 通知页回复失败，改走笔记页：{e}", file=sys.stderr, flush=True)
+        _handled, _msg = False, ''
+    if _handled:
+        if _msg.startswith('✅'):
+            _record_comment('replied', note_id, comment_id=comment_id, content=content)
+            _RateLimit.record('reply')
+        return f"{_reply_history_prefix}{_msg}"
 
     page, err = await _navigate_note(note_id, xsec_token)
     if err:
