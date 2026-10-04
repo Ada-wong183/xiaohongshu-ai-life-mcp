@@ -777,6 +777,8 @@ def process_url(url: str) -> str:
         if _host == 'xiaohongshu.com':
             processed_url = processed_url.replace('xiaohongshu.com', 'www.xiaohongshu.com', 1)
     
+    # 笔记链接没带 xsec_token 时，用缓存补上（缓存没有就原样返回）
+    processed_url = _add_cached_token(processed_url)
     return processed_url
 
 def _cdp_alive() -> bool:
