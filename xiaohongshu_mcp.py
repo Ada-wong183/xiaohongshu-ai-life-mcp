@@ -314,12 +314,35 @@ async def _rand_sleep(base: float, jitter: float = 0.4):
 _CJK_RE = re.compile(r'[㐀-鿿豈-﫿]')
 
 
-async def _human_type(page, text: str, wpm: int = None):
+_NL_MARK = "\u2424"  # ␤：评论里的换行占位符。网页端发送时会吞掉真换行，所以先打占位符，发请求时再换回 \n
+
+
+async def _ensure_nl_route(page):
+    """给页面装一个只作用于 comment/post 请求的拦截：把请求体里的占位符换成真换行。
+    网页端 JS 提交评论时会把输入框里的换行去掉，但服务器认 \\n（手机 App 就是这么发的）。
+    每个页面只装一次；请求体里没有占位符时原样放行。"""
+    if getattr(page, "_nl_route_on", False):
+        return
+    async def _h(route):
+        try:
+            body = route.request.post_data
+            if body and _NL_MARK in body:
+                await route.continue_(post_data=body.replace(_NL_MARK, "\\n"))
+                return
+        except Exception:
+            pass
+        await route.continue_()
+    await page.route("**/api/sns/web/v1/comment/post*", _h)
+    page._nl_route_on = True
+
+
+async def _human_type(page, text: str, wpm: int = None, soft_newline: bool = False):
     """模拟真人输入中文。
     - 汉字按 1~4 字一组用 insert_text 上屏（像输入法选词提交），每组之间 0.5~1.5 秒，约 2~3 字/秒
     - 英文/数字/符号逐键敲，换行按 Enter
     - 偶尔停下来"想一想"
     - 超过 200 字的长文按段落上屏（像从草稿粘贴过来），避免一篇笔记敲十几分钟
+    soft_newline=True 时换行打占位符 _NL_MARK（评论框里单按 Enter 会直接发送，网页端也会吞真换行；调用方需先 _ensure_nl_route）。
     wpm 参数保留只为兼容旧调用，已不使用。"""
     if len(text) > 200:
         lines = text.split('\n')
@@ -328,7 +351,7 @@ async def _human_type(page, text: str, wpm: int = None):
                 await page.keyboard.insert_text(line)
                 await asyncio.sleep(_random.uniform(0.8, 2.5))
             if i < len(lines) - 1:
-                await page.keyboard.press('Enter')
+                await (page.keyboard.insert_text(_NL_MARK) if soft_newline else page.keyboard.press('Enter'))
                 await asyncio.sleep(_random.uniform(0.2, 0.6))
         return
 
@@ -337,7 +360,7 @@ async def _human_type(page, text: str, wpm: int = None):
     while i < n:
         ch = text[i]
         if ch == '\n':
-            await page.keyboard.press('Enter')
+            await (page.keyboard.insert_text(_NL_MARK) if soft_newline else page.keyboard.press('Enter'))
             await asyncio.sleep(_random.uniform(0.5, 1.2))
             i += 1
         elif _CJK_RE.match(ch):
@@ -482,7 +505,7 @@ async def _type_with_at_mention(page, text: str, avatar_map: dict | None = None)
                 await page.keyboard.press('Enter')
                 await asyncio.sleep(0.5)
         else:
-            await _human_type(page, part)
+            await _human_type(page, part, soft_newline=True)
 
 
 async def _quick_comments(page, limit: int = 15) -> str:
@@ -2581,6 +2604,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
         if not main_page:  # 添加空检查
             return "浏览器初始化失败，请重试"
             
+        await _ensure_nl_route(main_page)
         await _type_with_at_mention(main_page, comment, avatar_map=avatar_map)
         await _rand_sleep(1)
 
@@ -2645,6 +2669,13 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
             else:
                 _warn = "\n⚠️ 未能解析笔记 ID，这条评论没有写入历史，请用 add_comment_history 手动补录。"
             _RateLimit.record('comment')
+            try:  # 发送后输入框应已清空，还有残留说明只发出去了一部分或没发出去
+                _left = await main_page.evaluate(
+                    "() => { const e=document.querySelector('[contenteditable=\"true\"]#content-textarea')||document.querySelector('#content-textarea')||document.querySelector('div[contenteditable=\"true\"]'); return e? (e.innerText||e.value||'').trim():''; }")
+                if _left:
+                    _warn += f"\n⚠️ 发送后输入框里还剩内容（{_left[:30]}…），可能只发出去一部分，请到浏览器确认。"
+            except Exception:
+                pass
             return f"{_history_prefix}已成功发布评论：{comment}{_warn}"
         else:
             return f"发布评论失败，请检查评论内容或网络连接"
@@ -3677,7 +3708,8 @@ async def _reply_via_notification(comment_id: str, content: str):
         return False, ''
     await _human_click(page, ta)
     await _rand_sleep(0.5)
-    await _human_type(page, content)
+    await _ensure_nl_route(page)
+    await _human_type(page, content, soft_newline=True)
     await asyncio.sleep(_random.uniform(0.8, 2.0))
 
     # ── 以下点了发送，出任何问题都不能再走原路径，否则会重复发 ──
