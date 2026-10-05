@@ -1034,28 +1034,77 @@ def _watch_process(kind: str, msgs: list):
         _watch_flush(prio)
 
 
+async def _watch_open_notifications(page) -> bool:
+    """像真人一样：在站内页面上点侧栏的"通知"入口进去（单页内跳转，带来源页）。
+    点不到入口就退回直接 goto。返回是否成功进入通知页。"""
+    for sel in ('a[href*="/notification"]', 'text="通知"'):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                await _human_click(page, await loc.element_handle())
+                await page.wait_for_url("**/notification**", timeout=8000)
+                return True
+        except Exception:
+            continue
+    await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
+    return True
+
+
+_notif_page_lock = asyncio.Lock()  # 常驻通知页同一时间只给一个人用（看门狗 / 回复）
+
+
+async def _enter_notifications(page):
+    """先让常驻页面停在站内普通页面，再点侧栏通知入口进通知页（看门狗和回复共用）。"""
+    if 'xiaohongshu.com' not in page.url or '/notification' in page.url:
+        await page.goto("https://www.xiaohongshu.com/explore", timeout=30000)
+        await asyncio.sleep(_random.uniform(3, 6))
+    else:
+        await asyncio.sleep(_random.uniform(1, 3))
+    await _watch_open_notifications(page)
+
+
+async def _watch_leave_notifications(page):
+    """看完回到发现页（点侧栏入口，点不到就 goto），让常驻页面停在站内普通页面，下次再点通知入口进来。"""
+    try:
+        loc = page.locator('a.link-wrapper[href^="/explore"]').first  # 侧栏"首页"入口，别匹配到笔记卡片
+        if await loc.count() and await loc.is_visible():
+            await _human_click(page, await loc.element_handle())
+            await asyncio.sleep(_random.uniform(1.5, 3))
+            if '/notification' not in page.url:
+                return
+        await page.goto("https://www.xiaohongshu.com/explore", timeout=30000)
+    except Exception:
+        pass
+
+
 async def _watch_fetch(delay: float = 0, include_follows: bool = True):
-    """开一个临时标签页看通知（评论@ + 新增关注），由 response 监听器负责处理数据。"""
-    global _watch_last_fetch, _watch_fetch_scheduled
+    """用常驻通知标签页看通知（评论@ + 新增关注），由 response 监听器负责处理数据。
+    和 get_notifications 共用 notifications_page：先停在站内普通页面，再点侧栏通知入口进去。"""
+    global _watch_last_fetch, _watch_fetch_scheduled, notifications_page
     try:
         if delay:
             await asyncio.sleep(delay)
         if _RateLimit.breaker_message() or not browser_context:
             return
-        _watch_last_fetch = _time.time()
-        page = await browser_context.new_page()
-        page.set_default_timeout(30000)
-        try:
-            await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
+        if _time.time() - _last_tool_ts < 60:  # 刚有工具在用浏览器，别抢常驻页面，下次再看
+            return
+        if _notif_page_lock.locked():  # 回复正在用常驻页面，这轮不抢
+            return
+        async with _notif_page_lock:
+            _watch_last_fetch = _time.time()
+            if notifications_page is None or notifications_page.is_closed():
+                notifications_page = await browser_context.new_page()
+                notifications_page.set_default_timeout(30000)
+            page = notifications_page
+            await _enter_notifications(page)
             await asyncio.sleep(_random.uniform(3, 6))
             if include_follows:
                 tab = page.locator('text="新增关注"').first
                 if await tab.count():
                     await _human_click(page, await tab.element_handle())
                     await asyncio.sleep(_random.uniform(2, 4))
-        finally:
             await asyncio.sleep(_random.uniform(0.5, 1.5))
-            await page.close()
+            await _watch_leave_notifications(page)
     except _RiskBlocked:
         pass
     except Exception as e:
@@ -3357,6 +3406,7 @@ async def get_my_notes(limit: int = 50) -> str:
                                 n.get('xsec_token') or n.get('xsecToken') or
                                 n.get('sec_token') or ''
                             )
+                            _remember_note_token(nid, xsec)  # 之后只给 note_id 也能打开这条笔记
                             tab_status = n.get('tab_status')
                             status_label = {0: '草稿', 1: '已发布', 2: '审核中', 3: '违规下架'}.get(tab_status, str(tab_status) if tab_status is not None else '')
                             all_notes.append({
@@ -3589,7 +3639,7 @@ async def _reply_via_notification(comment_id: str, content: str):
 
     page.on('response', on_resp)
     try:
-        await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
+        await _enter_notifications(page)
         await _rand_sleep(3)
     finally:
         page.remove_listener('response', on_resp)
@@ -3684,7 +3734,12 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
     if not await ensure_browser():
         return "请先登录小红书账号"
     try:
-        _handled, _msg = await _reply_via_notification(comment_id, content)
+        async with _notif_page_lock:
+            try:
+                _handled, _msg = await _reply_via_notification(comment_id, content)
+            finally:
+                if notifications_page is not None and not notifications_page.is_closed():
+                    await _watch_leave_notifications(notifications_page)  # 回复完回首页，页面不一直停在通知页
     except _RiskBlocked:
         raise
     except Exception as e:
@@ -3934,6 +3989,27 @@ def _make_text_image(title: str, content: str, output_path: str) -> None:
     img.save(output_path, "JPEG", quality=95)
 
 
+async def _pub_click(page, selector: str, text: str = "", timeout: float = 10.0) -> bool:
+    """创作者页点击：页面里常有隐藏的重复节点（在屏幕外 -9999 处）和叠在一起的重复节点，
+    所以只挑真正落在视口内的那一份，用真实鼠标坐标点，鼠标天然点到最上层。"""
+    t0 = asyncio.get_event_loop().time()
+    while asyncio.get_event_loop().time() - t0 < timeout:
+        pos = await page.evaluate("""([sel, txt]) => {
+            for (const e of document.querySelectorAll(sel)) {
+                if (txt && (e.innerText || '').trim() !== txt) continue;
+                const r = e.getBoundingClientRect();
+                if (r.width > 0 && r.height > 0 && r.left >= 0 && r.top >= 0 && r.top < innerHeight && r.left < innerWidth)
+                    return [r.left + r.width / 2, r.top + r.height / 2];
+            }
+            return null;
+        }""", [selector, text])
+        if pos:
+            await _human_click(page, x=pos[0], y=pos[1])
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+
 async def _fill_and_publish(page, title: str, content: str, tags: list,
                             text_card_mode: bool = False) -> str:
     """填写标题、正文、标签，然后点发布。供两种模式复用。"""
@@ -3965,8 +4041,9 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
             if content:
                 await _human_type(page, content)
     else:
-        # upload / pillow 模式：正文用 ql-editor
-        editor = await page.query_selector("div.ql-editor")
+        # upload / pillow 模式：现在发布页正文也是 tiptap（ql-editor 已不存在，留作旧版兜底）
+        editor = (await page.query_selector("div.tiptap.ProseMirror") or
+                  await page.query_selector("div.ql-editor"))
         if editor and content:
             await editor.click()
             await _rand_sleep(0.3)
@@ -3995,7 +4072,20 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
     # ── 点发布（xhs-publish-btn Web Component，closed shadow DOM）──
     # 通过页面加载时注入的 attachShadow 拦截器访问 closed shadow root
     # 按钮类名：button.ce-btn.bg-red（第二个 button，即"发布"）
-    clicked = await page.evaluate("""() => {
+    # 先取 shadow 里"发布"按钮的屏幕坐标，用真实鼠标点；取不到再退回 JS click
+    _pos = await page.evaluate("""() => {
+        const xb = document.querySelector('xhs-publish-btn');
+        const sh = xb && (window.__shadowRoots?.get(xb) || xb.shadowRoot);
+        const btn = sh && (sh.querySelector('button.ce-btn.bg-red') || sh.querySelector('button.bg-red'));
+        if (!btn) return null;
+        const r = btn.getBoundingClientRect();
+        return (r.width > 0 && r.height > 0) ? [r.left + r.width / 2, r.top + r.height / 2] : null;
+    }""")
+    if _pos:
+        await _human_click(page, x=_pos[0], y=_pos[1])
+        clicked = "clicked: mouse"
+    else:
+      clicked = await page.evaluate("""() => {
         const xhsBtn = document.querySelector('xhs-publish-btn');
         if (!xhsBtn) return null;
 
@@ -4020,13 +4110,18 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
     if 'no shadow' in clicked or 'shadow found but' in clicked:
         return f"发布按钮定位失败：{clicked}"
 
-    await asyncio.sleep(5)
-
-    # 检查是否跳转到成功页或笔记管理页
-    result_url = page.url
-    if any(kw in result_url for kw in ("success", "manage", "note-manager", "new/note")):
-        return "✅ 发布成功！"
-    return "✅ 已点击发布，请在小红书确认是否成功"
+    # 轮询最多 20 秒：跳到成功页/管理页，或页面出现"发布成功"，才算成功
+    for _ in range(20):
+        await asyncio.sleep(1)
+        result_url = page.url
+        if any(kw in result_url for kw in ("success", "manage", "note-manager")):
+            return "✅ 发布成功！"
+        try:
+            if await page.locator('text=/发布成功/').count():
+                return "✅ 发布成功！"
+        except Exception:
+            pass
+    return f"⚠️ 已点击发布，但 20 秒内没看到成功标志（当前 {page.url}），请到小红书确认"
 
 
 @mcp.tool()
@@ -4051,88 +4146,45 @@ async def delete_note(note_id: str) -> str:
             pass
         await _rand_sleep(2)
 
-        # 用笔记 ID 定位对应卡片（找包含该 ID 的链接，再向上找父卡片）
-        target = await page.evaluate(f"""() => {{
-            // 笔记管理页卡片里有指向笔记详情的链接，href 包含笔记 ID
-            for (const a of document.querySelectorAll('a[href]')) {{
-                if (a.href.includes('{note_id}')) {{
-                    // 向上找最近的 note-card 容器
-                    let el = a;
-                    for (let i = 0; i < 8; i++) {{
-                        if (el.className && el.className.includes && el.className.includes('note-card__body')) {{
-                            return {{ found: true, cls: el.className }};
-                        }}
-                        el = el.parentElement;
-                        if (!el) break;
-                    }}
-                    return {{ found: true, cls: 'via-link' }};
-                }}
-            }}
-            return {{ found: false }};
-        }}""")
-
-        if not target or not target.get('found'):
-            # 备用：用时间戳/标题找不到时，尝试直接导航到笔记详情页检查
+        # 卡片上已经没有带 note_id 的链接，id 只在卡片的 data-impression 属性里：
+        # 找"最小的、既含该 id 又含删除按钮"的祖先，取它里面删除按钮的坐标
+        target = None
+        for _ in range(3):
+            target = await page.evaluate("""(nid) => {
+                for (const del of document.querySelectorAll('.note-card__action-btn--del')) {
+                    let el = del;
+                    for (let i = 0; i < 10 && el; i++, el = el.parentElement) {
+                        // 爬到装着多张卡片的容器就停，否则容器必然含 id，会误选别的卡片的按钮
+                        if (el.querySelectorAll('.note-card__action-btn--del').length > 1) break;
+                        if (el.outerHTML.includes(nid)) {
+                            el.scrollIntoView({block: 'center'});  // 先滚，再读坐标
+                            const c = el.getBoundingClientRect();
+                            const d = del.getBoundingClientRect();
+                            return {card: [c.left + c.width / 2, c.top + c.height / 2],
+                                    del: [d.left + d.width / 2, d.top + d.height / 2]};
+                        }
+                    }
+                }
+                return null;
+            }""", note_id)
+            if target:
+                break
+            await _rand_sleep(1.5)
+        if not target:
             return f"找不到笔记 ID {note_id} 对应的卡片，请确认 ID 是否正确"
 
-        # 通过 JS hover 并点击删除按钮
-        result = await page.evaluate(f"""async () => {{
-            let card = null;
-            for (const a of document.querySelectorAll('a[href]')) {{
-                if (a.href.includes('{note_id}')) {{
-                    let el = a;
-                    for (let i = 0; i < 10; i++) {{
-                        if (el.className && typeof el.className === 'string' && el.className.includes('note-card')) {{
-                            card = el; break;
-                        }}
-                        el = el.parentElement;
-                        if (!el) break;
-                    }}
-                    break;
-                }}
-            }}
-            if (!card) return 'card not found';
-
-            // 触发 mouseenter 让操作按钮出现
-            card.dispatchEvent(new MouseEvent('mouseenter', {{bubbles: true}}));
-            card.dispatchEvent(new MouseEvent('mouseover', {{bubbles: true}}));
-
-            // 等一下
-            await new Promise(r => setTimeout(r, 600));
-
-            // 找该卡片内的删除按钮
-            const delBtn = card.querySelector('.note-card__action-btn--del');
-            if (delBtn) {{ delBtn.click(); return 'clicked'; }}
-
-            // 找不到就找全局（hover 后按钮可能渲染在外层）
-            const allDel = document.querySelectorAll('.note-card__action-btn--del');
-            if (allDel.length > 0) {{ allDel[0].click(); return 'clicked-global'; }}
-
-            return 'del btn not found';
-        }}""")
-
-        if 'not found' in result:
-            # 用 Playwright hover 作为备用
-            card_el = await page.query_selector(f'a[href*="{note_id}"]')
-            if card_el:
-                await card_el.hover()
-                await _rand_sleep(0.8)
-                await page.evaluate("() => document.querySelector('.note-card__action-btn--del')?.click()")
-            else:
-                return f"无法定位笔记卡片（ID: {note_id}）"
-
+        # 鼠标移到卡片上（让操作按钮出现）→ 再移到删除按钮点击
+        await page.mouse.move(target['card'][0], target['card'][1], steps=8)
+        await _rand_sleep(0.8)
+        await _human_click(page, x=target['del'][0], y=target['del'][1])
         await _rand_sleep(1)
 
-        # 点确认弹窗
-        confirmed = await page.evaluate("""() => {
-            for (const btn of document.querySelectorAll('button')) {
-                const txt = btn.innerText?.trim();
-                if (txt === '确定' || txt === '删除' || txt === '确认') {
-                    btn.click(); return txt;
-                }
-            }
-            return null;
-        }""")
+        # 点确认弹窗（只点视口内可见的那个）
+        confirmed = None
+        for _txt in ('确定', '删除', '确认'):
+            if await _pub_click(page, 'button', _txt, timeout=2):
+                confirmed = _txt
+                break
 
         if not confirmed:
             return "删除按钮已点击，但未找到确认弹窗，请手动确认"
@@ -4204,10 +4256,8 @@ async def publish_note(
             return f"创作者页面未正确加载（URL：{page.url}）"
 
         # ── 点"上传图文"标签（JS click，避免视口外问题）──────────
-        await page.evaluate("""() => {
-            for (const tab of document.querySelectorAll('div.creator-tab'))
-                if (tab.innerText.trim() === '上传图文') { tab.click(); return; }
-        }""")
+        if not await _pub_click(page, 'div.creator-tab', '上传图文'):
+            return "找不到\"上传图文\"标签"
         await _rand_sleep(1.5)
 
         # ════════════════════════════════════════════════════════
@@ -4215,9 +4265,8 @@ async def publish_note(
         # ════════════════════════════════════════════════════════
         if mode == "text_card":
             # 点"文字配图"按钮
-            await page.evaluate(
-                "() => document.querySelector('button.text2image-button')?.click()"
-            )
+            if not await _pub_click(page, 'button.text2image-button'):
+                return "找不到文字配图按钮"
             await _rand_sleep(2)
 
             # 等待 TipTap 编辑器出现
@@ -4235,10 +4284,8 @@ async def publish_note(
             await _rand_sleep(0.8)
 
             # 点"生成图片"
-            gen_btn = await page.query_selector("div.edit-text-button")
-            if not gen_btn:
+            if not await _pub_click(page, 'div.edit-text-button'):
                 return "找不到生成图片按钮"
-            await gen_btn.click()
             await _rand_sleep(2)
 
             # 循环点"下一步"，直到标题输入框出现（发布编辑页）
@@ -4276,10 +4323,7 @@ async def publish_note(
                     break
 
                 # 点下一步
-                await page.evaluate("""() => {
-                    for (const btn of document.querySelectorAll('button'))
-                        if (btn.innerText?.trim() === '下一步') { btn.click(); return; }
-                }""")
+                await _pub_click(page, 'button', '下一步', timeout=3)
                 await _rand_sleep(2.5)
 
         # ════════════════════════════════════════════════════════
