@@ -1,4 +1,4 @@
-playwright>=1.40.0
+patchright>=1.50.0
 playwright-stealth>=1.0.6
 fastmcp>=2.0.0
 pandas>=2.0.0

@@ -1,4 +1,5 @@
 import sys
+import math
 from typing import Any, List, Dict, Optional
 import asyncio
 import json
@@ -30,7 +31,30 @@ from contextlib import asynccontextmanager as _asynccontextmanager
 import pandas as pd
 from datetime import datetime
 from urllib.parse import quote
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright  # patchright：Playwright 的补丁分支，去掉 Runtime.enable 的 CDP 泄漏（接口基本一致）
+import patchright.async_api as _pr_api
+
+
+def _patch_main_world_eval():
+    """patchright 的 evaluate 默认跑在隔离世界，读不到页面自己的全局变量（如 window.__INITIAL_STATE__、
+    我们 add_init_script 里存的 window.__shadowRoots）。本项目大量依赖这些，所以把所有 evaluate 类方法
+    的 isolated_context 默认值改成 False（主世界，行为和原版 Playwright 一致）。调用方显式传值时尊重调用方。"""
+    import functools
+    for _cls in (_pr_api.Page, _pr_api.Frame, _pr_api.Locator, _pr_api.ElementHandle, _pr_api.JSHandle):
+        for _name in ("evaluate", "evaluate_handle", "evaluate_all"):
+            _orig = getattr(_cls, _name, None)
+            if _orig is None:
+                continue
+            def _mk(orig):
+                @functools.wraps(orig)
+                async def _w(self, *a, **kw):
+                    kw.setdefault("isolated_context", False)
+                    return await orig(self, *a, **kw)
+                return _w
+            setattr(_cls, _name, _mk(_orig))
+
+
+_patch_main_world_eval()
 from fastmcp import FastMCP
 import requests
 
@@ -256,6 +280,7 @@ def _arm_page(page):
 
     page.goto = _guarded_goto
     page.on("framenavigated", _on_nav)
+    page.on("websocket", _watch_on_ws)  # 私信实时推送（见"私信看门狗"）
     page._risk_armed = True
 
 
@@ -263,23 +288,136 @@ async def _skim(page):
     """打开笔记后先看一会儿：随机滚两三下再回来，避免"一打开就评论"。"""
     try:
         vp = page.viewport_size or {'width': 1280, 'height': 800}
-        await page.mouse.move(vp['width'] * _random.uniform(0.35, 0.6), vp['height'] * _random.uniform(0.35, 0.6),
-                              steps=_random.randint(6, 14))
+        await _human_move(page, vp['width'] * _random.uniform(0.35, 0.6), vp['height'] * _random.uniform(0.35, 0.6))
         await _rand_sleep(_random.uniform(3, 6))
         for _ in range(_random.randint(2, 3)):
-            await page.mouse.wheel(0, _random.randint(200, 550))
+            await _human_wheel(page, _random.randint(200, 550))
             await _rand_sleep(_random.uniform(1.5, 4))
         if _random.random() < 0.6:
-            await page.mouse.wheel(0, -_random.randint(150, 400))
+            await _human_wheel(page, -_random.randint(150, 400))
             await _rand_sleep(_random.uniform(1, 2.5))
     except Exception:
         pass
+
+
+async def _idle_hover(page):
+    """停在页面上看东西时，鼠标不会一动不动：随机漂移 1~3 次（幅度不大），偶尔轻轻滚一下。
+    给看门狗看通知用——进了通知页之后以前只是干等几秒，页面上没有任何鼠标活动。"""
+    try:
+        vp = page.viewport_size or {'width': 1280, 'height': 800}
+        x0, y0 = _mouse_pos(page)
+        for _ in range(_random.randint(1, 3)):
+            nx = min(max(x0 + _random.uniform(-220, 220), 40), vp['width'] - 40)
+            ny = min(max(y0 + _random.uniform(-160, 160), 80), vp['height'] - 40)
+            await _human_move(page, nx, ny)
+            x0, y0 = nx, ny
+            await asyncio.sleep(_random.uniform(0.6, 2.2))
+        if _random.random() < 0.35:
+            await _human_wheel(page, _random.randint(80, 260))
+            await asyncio.sleep(_random.uniform(0.8, 2.0))
+            if _random.random() < 0.6:
+                await _human_wheel(page, -_random.randint(60, 200))
+                await asyncio.sleep(_random.uniform(0.5, 1.5))
+    except Exception:
+        pass
+
+
+def _mouse_pos(page):
+    """记住鼠标上次停在哪（Playwright 不告诉我们），第一次用视口中间附近的随机点。"""
+    p = getattr(page, "_mpos", None)
+    if p is None:
+        vp = page.viewport_size or {'width': 1280, 'height': 800}
+        p = (vp['width'] * _random.uniform(0.3, 0.7), vp['height'] * _random.uniform(0.3, 0.7))
+        page._mpos = p
+    return p
+
+
+async def _human_move(page, x: float, y: float):
+    """从鼠标当前位置沿一条弯曲的轨迹移到 (x, y)：
+    - 三次贝塞尔曲线，两个控制点随机偏离直线（像手腕画弧）
+    - 最小加加速度时间曲线：起步慢、中段快、临近目标减速
+    - 沿途带细微抖动，越靠近目标抖得越小；总时长随距离按 Fitts 定律增长
+    - 距离远时有 30% 概率先冲过头一点，再回拉修正
+    - 全程用同一个"当前位置"，不会从一个点瞬移到另一个点"""
+    x0, y0 = _mouse_pos(page)
+    x, y = float(x), float(y)
+    dist = math.hypot(x - x0, y - y0)
+    if dist < 3:
+        await page.mouse.move(x, y)
+        page._mpos = (x, y)
+        return
+
+    async def _leg(ax, ay, bx, by, dur):
+        d = math.hypot(bx - ax, by - ay)
+        if d < 2:
+            await page.mouse.move(bx, by)
+            return
+        ux, uy = (bx - ax) / d, (by - ay) / d
+        px, py = -uy, ux  # 垂直方向
+        bend = min(90.0, d * 0.18)
+        o1, o2 = _random.uniform(-bend, bend), _random.uniform(-bend, bend)
+        t1, t2 = _random.uniform(0.2, 0.4), _random.uniform(0.6, 0.85)
+        c1 = (ax + (bx - ax) * t1 + px * o1, ay + (by - ay) * t1 + py * o1)
+        c2 = (ax + (bx - ax) * t2 + px * o2, ay + (by - ay) * t2 + py * o2)
+        n = max(8, min(110, int(dur / 0.013)))
+        for i in range(1, n + 1):
+            t = i / n
+            s = t * t * t * (10 - 15 * t + 6 * t * t)  # 最小加加速度
+            m = 1 - s
+            bxs = m**3 * ax + 3 * m * m * s * c1[0] + 3 * m * s * s * c2[0] + s**3 * bx
+            bys = m**3 * ay + 3 * m * m * s * c1[1] + 3 * m * s * s * c2[1] + s**3 * by
+            if i < n:
+                shake = 1.2 * (1 - t)
+                bxs += _random.uniform(-shake, shake)
+                bys += _random.uniform(-shake, shake)
+            else:
+                bxs, bys = bx, by
+            await page.mouse.move(bxs, bys)
+            await asyncio.sleep(max(0.004, dur / n * _random.uniform(0.7, 1.3)))
+
+    dur = min(1.7, 0.16 + 0.12 * math.log2(dist / 30 + 1)) * _random.uniform(0.8, 1.35)
+    if dist > 250 and _random.random() < 0.3:
+        over = _random.uniform(8, 24)
+        ox = x + (x - x0) / dist * over + _random.uniform(-4, 4)
+        oy = y + (y - y0) / dist * over + _random.uniform(-4, 4)
+        await _leg(x0, y0, ox, oy, dur * 0.9)
+        await asyncio.sleep(_random.uniform(0.04, 0.12))
+        await _leg(ox, oy, x, y, _random.uniform(0.12, 0.28))
+    else:
+        await _leg(x0, y0, x, y, dur)
+    page._mpos = (x, y)
+
+
+async def _human_wheel(page, dy: float):
+    """滚动 dy 像素，拆成一串递减的小滚轮（像触控板/滚轮的惯性），而不是一次整格跳。
+    正数向下，负数向上；偶尔在末尾回弹一小段。总和严格等于 dy。"""
+    total = int(dy)
+    if total == 0:
+        return
+    sign = 1 if total > 0 else -1
+    mag = abs(total)
+    n = max(3, min(14, mag // 55 + _random.randint(1, 3)))
+    w = [(1.0 - i / (n + 1)) ** 1.6 * _random.uniform(0.8, 1.2) + 0.1 for i in range(n)]
+    sw = sum(w)
+    parts = [int(mag * wi / sw) for wi in w]
+    parts[0] += mag - sum(parts)
+    for i, p in enumerate(parts):
+        if p:
+            await page.mouse.wheel(0, sign * p)
+        await asyncio.sleep(_random.uniform(0.012, 0.045) * (1 + i * 0.12))
+    if mag > 250 and _random.random() < 0.2:
+        await asyncio.sleep(_random.uniform(0.1, 0.3))
+        await page.mouse.wheel(0, -sign * _random.randint(8, 40))
 
 
 async def _human_click(page, element=None, x: float = None, y: float = None):
     """模拟人类鼠标轨迹后点击，降低自动化特征。元素不可见时降级为普通 click。"""
     try:
         if element is not None:
+            try:  # 原版 element.click() 会先把元素滚进可视区，这里要补上，否则鼠标会点到屏幕外
+                await element.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
             box = await element.bounding_box()
             if box is None:
                 await element.click()
@@ -290,12 +428,11 @@ async def _human_click(page, element=None, x: float = None, y: float = None):
             cx, cy = float(x), float(y)
         else:
             return
-        # 先移到附近偏移点，再缓慢移到目标，模拟自然轨迹
-        await page.mouse.move(cx + _random.uniform(-40, 40), cy + _random.uniform(-20, 20))
-        await asyncio.sleep(_random.uniform(0.05, 0.15))
-        await page.mouse.move(cx, cy, steps=_random.randint(5, 12))
-        await asyncio.sleep(_random.uniform(0.05, 0.12))
-        await page.mouse.click(cx, cy)
+        await _human_move(page, cx, cy)
+        await asyncio.sleep(_random.uniform(0.08, 0.28))  # 到位后停一下再按
+        await page.mouse.down()
+        await asyncio.sleep(_random.uniform(0.04, 0.13))   # 按住一小会儿
+        await page.mouse.up()
     except Exception:
         if element is not None:
             try:
@@ -334,6 +471,24 @@ async def _ensure_nl_route(page):
         await route.continue_()
     await page.route("**/api/sns/web/v1/comment/post*", _h)
     page._nl_route_on = True
+
+
+_SHIFT_CHARS = frozenset('ABCDEFGHIJKLMNOPQRSTUVWXYZ~!@#$%^&*()_+{}|:"<>?')
+
+
+async def _key_char(page, ch: str):
+    """敲一个字符，像真人键盘：大写字母和需要 Shift 的符号先按 Shift，再按键，再抬起；按住时长带随机。
+    page.keyboard.type 对大写/符号不会发 Shift 事件，键盘日志里"有大写没 Shift"是典型的自动化特征。"""
+    need = ch in _SHIFT_CHARS
+    if need:
+        await page.keyboard.down('Shift')
+        await asyncio.sleep(_random.uniform(0.03, 0.09))
+    await page.keyboard.down(ch)
+    await asyncio.sleep(_random.uniform(0.045, 0.12))
+    await page.keyboard.up(ch)
+    if need:
+        await asyncio.sleep(_random.uniform(0.02, 0.07))
+        await page.keyboard.up('Shift')
 
 
 async def _human_type(page, text: str, wpm: int = None, soft_newline: bool = False):
@@ -376,7 +531,7 @@ async def _human_type(page, text: str, wpm: int = None, soft_newline: bool = Fal
             await asyncio.sleep(_random.uniform(0.4, 1.0))
             i += 1
         else:
-            await page.keyboard.type(ch)
+            await _key_char(page, ch)
             await asyncio.sleep(_random.uniform(0.08, 0.25) if ch not in '.,!?' else _random.uniform(0.3, 0.7))
             i += 1
         if _random.random() < 0.06:
@@ -426,10 +581,13 @@ async def _type_with_at_mention(page, text: str, avatar_map: dict | None = None)
         m = re.fullmatch(r'@(\S+)', part)
         if m:
             search_term = m.group(1)
-            await page.keyboard.type('@')
+            await _key_char(page, '@')
             await asyncio.sleep(1.5)
             for ch in search_term:
-                await page.keyboard.type(ch)
+                if _CJK_RE.match(ch):
+                    await page.keyboard.type(ch)
+                else:
+                    await _key_char(page, ch)
                 await asyncio.sleep(0.25)
             # 等待 picker 出现（最多 3 秒），然后一次性在 JS 里找到目标项坐标
             await asyncio.sleep(0.3)
@@ -1120,12 +1278,15 @@ async def _watch_fetch(delay: float = 0, include_follows: bool = True):
                 notifications_page.set_default_timeout(30000)
             page = notifications_page
             await _enter_notifications(page)
-            await asyncio.sleep(_random.uniform(3, 6))
+            await asyncio.sleep(_random.uniform(2, 4))
+            await _idle_hover(page)  # 看通知时鼠标随手动一动
             if include_follows:
                 tab = page.locator('text="新增关注"').first
                 if await tab.count():
                     await _human_click(page, await tab.element_handle())
                     await asyncio.sleep(_random.uniform(2, 4))
+                    if _random.random() < 0.5:
+                        await _idle_hover(page)
             await asyncio.sleep(_random.uniform(0.5, 1.5))
             await _watch_leave_notifications(page)
     except _RiskBlocked:
@@ -1162,6 +1323,136 @@ async def _watch_on_response(resp):
         pass
 
 
+# ── 私信看门狗 ─────────────────────────────────────────────
+# 触发：页面常驻的推送 WebSocket（wss://apppush-rws.xiaohongshu.com）收到非心跳帧（t=0 是心跳，新私信是 t=4）
+# 确认：重新加载 /explore，读页面自己请求的 chat/get_unread（每个会话的未读数）和 v3/chats（最后一条消息）
+# 不点开会话，所以不会标已读。兜底：_watch_loop 每轮也查一次（WebSocket 可能没挂上）。
+_dm_check_scheduled = False
+_dm_check_lock = asyncio.Lock()
+
+
+def _watch_on_ws(ws):
+    try:
+        if 'apppush' not in ws.url:
+            return
+        opened = _time.time()
+
+        def _on_frame(payload):
+            try:
+                if _time.time() - opened < 25:  # 刚连上时会推一批初始数据，忽略
+                    return
+                txt = payload if isinstance(payload, str) else payload.decode('utf-8', 'ignore')
+                if json.loads(txt).get('t') in (0, None):  # t=0 是心跳；实测新私信推送是 t=4，初始数据是 t=2，其余非心跳帧都当触发信号（有去重和未读数二次确认）
+                    return
+            except Exception:
+                return
+            _dm_schedule()
+
+        ws.on("framereceived", _on_frame)
+    except Exception:
+        pass
+
+
+def _dm_schedule():
+    global _dm_check_scheduled
+    if not XHS_WATCH_ON or _dm_check_scheduled:
+        return
+    _dm_check_scheduled = True
+    asyncio.get_running_loop().create_task(_watch_dm_check(delay=_random.uniform(15, 60), retries=3))
+
+
+def _watch_dm_process(unread: dict, chats: list):
+    """unread: {chat_user_id: 未读数}；chats: v3/chats 的会话列表。有新的未读私信就写唤醒日志。"""
+    try:
+        by_id = {c.get('chat_user_id'): c for c in chats}
+        with _watch_db() as conn:
+            first_run = conn.execute("SELECT COUNT(*) FROM notif_seen WHERE msg_id LIKE 'dm:%'").fetchone()[0] == 0
+            new = []
+            for uid, n in unread.items():
+                if not n:
+                    continue
+                c = by_id.get(uid) or {}
+                key = f"dm:{uid}:{c.get('last_msg_time', '')}:{n}"
+                if conn.execute("SELECT 1 FROM notif_seen WHERE msg_id=?", (key,)).fetchone():
+                    continue
+                conn.execute("INSERT OR IGNORE INTO notif_seen (msg_id, seen_at) VALUES (?, ?)", (key, _time.time()))
+                new.append((uid, n, c))
+            if first_run:  # 留个标记，否则首次没有未读时基线永远"未完成"，之后第一条真私信会被吞掉
+                conn.execute("INSERT OR IGNORE INTO notif_seen (msg_id, seen_at) VALUES ('dm:init', ?)", (_time.time(),))
+    except Exception as e:
+        print(f"[watch] 读写私信已见记录失败: {e}", file=sys.stderr, flush=True)
+        return
+    if first_run:
+        print(f"[watch] 私信首次运行，{len(new)} 个未读会话记为已见，不叫醒", file=sys.stderr, flush=True)
+        return
+    if not new:
+        return
+    lines, prio = [], False
+    for uid, n, c in new:
+        info = c.get('info') or {}
+        nick = info.get('user_name') or info.get('nickname') or '?'
+        is_prio = uid in XHS_PRIORITY or nick in XHS_PRIORITY
+        prio = prio or is_prio
+        last = (c.get('last_msg_content') or '').replace('\n', ' ')[:80]
+        lines.append(("⚡" if is_prio else "") + f"💌 {nick} 给你发了私信（未读 {n} 条）：{last}\n   chat_user_id: {uid}")
+    _wake_write("📕 小红书·关联号私信" if prio else "📕 小红书私信",
+                f"小红书有 {len(lines)} 个会话有新私信：\n" + "\n".join(lines) +
+                "\n（看对话用 read_chat(昵称)，会标已读；回复用 send_chat(昵称, 内容)）",
+                "xhs_priority_dm" if prio else "xhs_dm")
+    print(f"[watch] 已写私信唤醒日志：{len(lines)} 个会话", file=sys.stderr, flush=True)
+
+
+async def _watch_dm_check(delay: float = 0, retries: int = 0):
+    """重新加载 /explore，抓 get_unread 和 v3/chats，判断有没有新私信。和其他用常驻页面的操作共用 _notif_page_lock。"""
+    global _dm_check_scheduled, notifications_page
+    try:
+        if delay:
+            await asyncio.sleep(delay)
+        for attempt in range(retries + 1):
+            if _RateLimit.breaker_message() or not browser_context:
+                return
+            if _time.time() - _last_tool_ts < 60 or _notif_page_lock.locked():  # 工具/回复在用页面，等一会儿再来
+                if attempt < retries:
+                    await asyncio.sleep(_random.uniform(60, 120))
+                    continue
+                return
+            break
+        async with _notif_page_lock:
+            if notifications_page is None or notifications_page.is_closed():
+                notifications_page = await browser_context.new_page()
+                notifications_page.set_default_timeout(30000)
+            page = notifications_page
+            cap = {'unread': None, 'chats': []}
+
+            async def on_resp(r):
+                try:
+                    if '/api/im/web/chat/get_unread' in r.url:
+                        cap['unread'] = ((await r.json()).get('data') or {}).get('user_chat_unread_counts') or {}
+                    elif '/api/im/web/v3/chats?' in r.url:
+                        cap['chats'].extend(((await r.json()).get('data') or {}).get('chats') or [])
+                except Exception:
+                    pass
+
+            page.on('response', on_resp)
+            try:
+                await page.goto("https://www.xiaohongshu.com/explore", timeout=30000)
+                for _ in range(30):
+                    if cap['unread'] is not None and cap['chats']:
+                        break
+                    await asyncio.sleep(0.5)
+                await asyncio.sleep(_random.uniform(1, 2))
+            finally:
+                page.remove_listener('response', on_resp)
+            if cap['unread'] is not None:
+                _watch_dm_process(cap['unread'], cap['chats'])
+    except _RiskBlocked:
+        pass
+    except Exception as e:
+        print(f"[watch] 查私信出错：{e}", file=sys.stderr, flush=True)
+    finally:
+        _dm_check_scheduled = False
+
+
 async def _watch_loop():
     """兜底巡查：每 30~60 分钟看一次通知并把攒着的写出去（只在 XHS_WATCH_HOURS 时段内）。
     顺带保证浏览器开着，这样页面自己的 unread_count 轮询才能跑起来。"""
@@ -1173,6 +1464,7 @@ async def _watch_loop():
                     if _time.time() - _watch_last_fetch > _WATCH_FETCH_GAP_DAY:
                         await _watch_fetch()
                     _watch_flush()
+                    await _watch_dm_check()
         except _RiskBlocked:
             pass
         except Exception as e:
@@ -1211,9 +1503,8 @@ async def _idle_session():
             if _idle_should_stop():
                 break
             vp = page.viewport_size or {'width': 1280, 'height': 800}
-            await page.mouse.move(vp['width'] * _random.uniform(0.2, 0.8), vp['height'] * _random.uniform(0.3, 0.7),
-                                  steps=_random.randint(5, 12))
-            await page.mouse.wheel(0, _random.randint(300, 900))
+            await _human_move(page, vp['width'] * _random.uniform(0.2, 0.8), vp['height'] * _random.uniform(0.3, 0.7))
+            await _human_wheel(page, _random.randint(300, 900))
             await asyncio.sleep(_random.uniform(2, 7))
             if opened >= target_open or _random.random() > 0.45:
                 continue
@@ -1229,7 +1520,7 @@ async def _idle_session():
             for _ in range(_random.randint(1, 4)):  # 在笔记里看看图文和评论
                 if _idle_should_stop():
                     break
-                await page.mouse.wheel(0, _random.randint(150, 500))
+                await _human_wheel(page, _random.randint(150, 500))
                 await asyncio.sleep(_random.uniform(2, 6))
             await asyncio.sleep(_random.uniform(4, 20))
             await page.keyboard.press('Escape')
@@ -1304,9 +1595,9 @@ async def follow_user(user_id: str, xsec_token: str = "") -> str:
         nick = await page.evaluate("() => (document.querySelector('.user-nickname, [class*=\"user-name\"]')||{}).innerText || ''")
         # 先看看对方的笔记，再回到顶部点关注
         for _ in range(_random.randint(1, 3)):
-            await page.mouse.wheel(0, _random.randint(300, 700))
+            await _human_wheel(page, _random.randint(300, 700))
             await asyncio.sleep(_random.uniform(2, 5))
-        await page.mouse.wheel(0, -3000)
+        await _human_wheel(page, -3000)
         await asyncio.sleep(_random.uniform(1.5, 3))
 
         btn = page.locator('button.follow-button').first
@@ -1497,7 +1788,7 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
         return f"搜索笔记时出错: {str(e)}"
 
 @mcp.tool()
-async def get_note_content(url: str, include_images: bool = True) -> str:
+async def get_note_content(url: str, include_images: bool = True, include_comments: bool = True) -> str:
     """获取笔记正文、配图和前15条评论，一次调用返回完整内容。有笔记链接时首选此工具，不要用 search_notes 代替。
     支持完整链接（xiaohongshu.com/explore/...）和短链（xhslink.cn/...）。
     如需获取更多评论，再单独调用 get_note_comments。
@@ -1507,6 +1798,7 @@ async def get_note_content(url: str, include_images: bool = True) -> str:
         include_images: 是否处理配图（默认 True）。
             ≤4张：下载到本地，返回路径供 AI 直接读取图片内容；
             >4张：调用 Gemini 3.6 Flash 分析图片，返回文字描述。
+        include_comments: 是否顺带返回前15条评论（默认 True）。只想看正文、不需要评论时传 False。
     """
     login_status = await ensure_browser()
     if not login_status:
@@ -2111,7 +2403,7 @@ async def get_note_content(url: str, include_images: bool = True) -> str:
 
         # ── 前15条评论（页面已加载，顺带抓，省一次调用）────────────
         try:
-            comments_text = await _quick_comments(main_page, limit=15)
+            comments_text = await _quick_comments(main_page, limit=15) if include_comments else ''
             if comments_text:
                 result += f"\n\n💬 前15条评论：\n{comments_text}"
         except Exception:
@@ -4206,7 +4498,7 @@ async def delete_note(note_id: str) -> str:
             return f"找不到笔记 ID {note_id} 对应的卡片，请确认 ID 是否正确"
 
         # 鼠标移到卡片上（让操作按钮出现）→ 再移到删除按钮点击
-        await page.mouse.move(target['card'][0], target['card'][1], steps=8)
+        await _human_move(page, target['card'][0], target['card'][1])
         await _rand_sleep(0.8)
         await _human_click(page, x=target['del'][0], y=target['del'][1])
         await _rand_sleep(1)
@@ -4420,6 +4712,449 @@ async def publish_note(
                 os.remove(temp_img)
             except Exception:
                 pass
+
+
+# ══════════════════════════════════════════════════════════════
+# 私信（网页版 /chat）
+# 读：监听页面自己发的 /api/im/web/v3/chats 和 /api/im/web/messages/history 响应，不另外调接口
+# 写：点会话 → 点输入框 → 真人节奏打字 → 点发送。只能给已有会话发，不主动私信陌生人
+# 本地只记"我发过什么"（dm_history），对方的消息不落盘，要看就拉
+# ══════════════════════════════════════════════════════════════
+
+_RateLimit._limits['dm'] = {'min_interval': 30, 'max_per_hour': 20}
+
+
+def _init_dm_db():
+    try:
+        conn = sqlite3.connect(ACTIONS_DB)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS dm_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_user_id TEXT NOT NULL,
+                user_name TEXT DEFAULT '',
+                content TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dm_user ON dm_history(chat_user_id, created_at)")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+_init_dm_db()
+
+
+def _record_dm(chat_user_id: str, user_name: str, content: str):
+    try:
+        conn = sqlite3.connect(ACTIONS_DB)
+        conn.execute("INSERT INTO dm_history (chat_user_id, user_name, content, created_at) VALUES (?,?,?,?)",
+                     (chat_user_id, user_name, content, datetime.now().isoformat(timespec='seconds')))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[dm_history] 写入失败 {chat_user_id}: {e}", file=sys.stderr, flush=True)
+
+
+def _get_dm_history(chat_user_id: str = '', limit: int = 20) -> list:
+    try:
+        conn = sqlite3.connect(ACTIONS_DB)
+        conn.row_factory = sqlite3.Row
+        q, params = "SELECT chat_user_id, user_name, content, created_at FROM dm_history WHERE 1=1", []
+        if chat_user_id:
+            q += " AND chat_user_id = ?"
+            params.append(chat_user_id)
+        q += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(q, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+
+def _dm_text(msg: dict) -> str:
+    """把一条私信的套娃 JSON 拆成可读文字。front_chain 是页面自己用的摘要，兜底用。"""
+    raw = msg.get('content') or ''
+    try:
+        o = json.loads(raw)
+    except Exception:
+        return str(raw)[:200]
+    ct = o.get('content_type')
+    inner = o.get('content') or ''
+    if ct == 1:  # 文字
+        return inner
+    if ct == 4:  # 系统提示（如"互相关注"）
+        try:
+            return '（系统）' + (json.loads(inner).get('content') or o.get('front_chain') or '')
+        except Exception:
+            return '（系统）' + (o.get('front_chain') or '')
+    # 图片 / 笔记卡片 / 其他
+    try:
+        card = json.loads(inner) if isinstance(inner, str) and inner.startswith('{') else {}
+    except Exception:
+        card = {}
+    if card.get('title') and card.get('link'):
+        return f"[分享笔记] {card.get('title')}"
+    return o.get('front_chain') or '[非文字消息]'
+
+
+def _dm_time(ms) -> str:
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000).strftime('%m-%d %H:%M')
+    except Exception:
+        return ''
+
+
+async def _enter_chat(page):
+    """停在站内普通页面 → 点侧栏"消息"进私信页，同时收集会话列表接口的响应。
+    返回 (chats, my_id)：chats 是会话 dict 列表。必须在 _notif_page_lock 里调用。"""
+    chats, seen = [], set()
+    my_id = ''
+
+    async def on_resp(r):
+        if '/api/im/web/v3/chats?' in r.url:
+            try:
+                d = (await r.json()).get('data', {})
+                for c in d.get('chats', []) or []:
+                    if c.get('chat_user_id') not in seen:
+                        seen.add(c.get('chat_user_id'))
+                        chats.append(c)
+            except Exception:
+                pass
+
+    page.on('response', on_resp)
+    try:
+        if 'xiaohongshu.com' not in page.url or '/chat' in page.url or '/notification' in page.url:
+            await page.goto("https://www.xiaohongshu.com/explore", timeout=30000)
+            await asyncio.sleep(_random.uniform(3, 6))
+        else:
+            await asyncio.sleep(_random.uniform(1, 3))
+        entered = False
+        try:
+            loc = page.locator('a.link-wrapper[href^="/chat"]').first
+            if await loc.count() and await loc.is_visible():
+                await _human_click(page, await loc.element_handle())
+                await page.wait_for_url("**/chat**", timeout=8000)
+                entered = True
+        except Exception:
+            pass
+        if not entered:
+            await page.goto("https://www.xiaohongshu.com/chat", timeout=30000)
+        await page.wait_for_selector('.xhs-im-conv-item', timeout=15000)
+        await asyncio.sleep(_random.uniform(2.5, 4))  # 等分页的会话列表请求回来
+    finally:
+        page.remove_listener('response', on_resp)
+    if chats:
+        my_id = chats[0].get('user_id', '')
+    return chats, my_id
+
+
+def _dm_pick(chats: list, user: str):
+    """按昵称或 chat_user_id 找会话。返回 (chat, err)。昵称先精确、再唯一子串。"""
+    user = (user or '').strip()
+    if not user:
+        return None, "请指定对方昵称或 chat_user_id"
+    def nm(c): return (c.get('info') or {}).get('user_name') or (c.get('info') or {}).get('nickname') or ''
+    for c in chats:
+        if c.get('chat_user_id') == user:
+            return c, None
+    exact = [c for c in chats if nm(c) == user]
+    if len(exact) == 1:
+        return exact[0], None
+    cand = exact or [c for c in chats if user.lower() in nm(c).lower()]
+    if len(cand) == 1:
+        return cand[0], None
+    if not cand:
+        return None, f"会话列表里找不到「{user}」。私信工具只能操作已有会话（不主动私信陌生人）。"
+    return None, "匹配到多个会话，请用 chat_user_id 指定：\n" + "\n".join(f"  · {nm(c)}  {c.get('chat_user_id')}" for c in cand)
+
+
+async def _dm_open_conversation(page, name: str) -> bool:
+    """在左侧会话列表里点中指定昵称的那一项（真鼠标）。"""
+    pos = await page.evaluate("""(name) => {
+        const items = [...document.querySelectorAll('.xhs-im-conv-item')];
+        const it = items.find(e => (e.querySelector('.xhs-im-conv-item__name')?.innerText || '').trim() === name);
+        if (!it) return null;
+        it.scrollIntoView({block: 'center'});
+        const r = it.getBoundingClientRect();
+        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    }""", name)
+    if not pos:
+        return False
+    await asyncio.sleep(0.5)
+    pos = await page.evaluate("""(name) => {
+        const it = [...document.querySelectorAll('.xhs-im-conv-item')].find(e => (e.querySelector('.xhs-im-conv-item__name')?.innerText || '').trim() === name);
+        const r = it.getBoundingClientRect();
+        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+    }""", name)
+    await _human_click(page, x=pos['x'], y=pos['y'])
+    return True
+
+
+@mcp.tool()
+async def get_chats(limit: int = 20) -> str:
+    """查看私信会话列表（对方昵称、最后一条消息、时间）。只看列表，不会点开会话，所以不会把任何消息标成已读。
+    网页版私信只能操作已有会话。
+
+    Args:
+        limit: 最多返回多少个会话，默认 20（按最近消息时间排序）
+    """
+    _b = _RateLimit.breaker_message()
+    if _b:
+        return _b
+    if not await ensure_browser():
+        return "请先登录小红书账号"
+    global notifications_page
+    try:
+        async with _notif_page_lock:
+            if notifications_page is None or notifications_page.is_closed():
+                notifications_page = await browser_context.new_page()
+                notifications_page.set_default_timeout(30000)
+            try:
+                chats, _ = await _enter_chat(notifications_page)
+            finally:
+                await _watch_leave_notifications(notifications_page)
+    except _RiskBlocked:
+        raise
+    except Exception as e:
+        return f"打开私信页失败：{e}"
+    if not chats:
+        return "没有读到会话列表（页面可能没加载出来，稍后再试）"
+    chats.sort(key=lambda c: c.get('last_msg_time') or 0, reverse=True)
+    lines = [f"私信会话（共 {len(chats)} 个，显示 {min(limit, len(chats))} 个）：", ""]
+    for c in chats[:limit]:
+        info = c.get('info') or {}
+        name = info.get('user_name') or info.get('nickname') or '?'
+        flag = '' if info.get('is_friend') else '（非好友）'
+        lines.append(f"· {name}{flag}  [{_dm_time(c.get('last_msg_time'))}]  {(c.get('last_msg_content') or '')[:50]}")
+        lines.append(f"    chat_user_id: {c.get('chat_user_id')}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def read_chat(user: str, limit: int = 20) -> str:
+    """读和某人的私信聊天记录（最近 N 条，按时间正序）。
+    ⚠️ 会点开会话，页面会自动把该会话标成已读，对方那边会显示"已读"。只想看有哪些会话用 get_chats。
+
+    Args:
+        user: 对方昵称，或 get_chats 里给的 chat_user_id
+        limit: 最多返回多少条，默认 20（单次最多 30 条，是页面一次加载的量）
+    """
+    _b = _RateLimit.breaker_message()
+    if _b:
+        return _b
+    if not await ensure_browser():
+        return "请先登录小红书账号"
+    global notifications_page
+    try:
+        async with _notif_page_lock:
+            if notifications_page is None or notifications_page.is_closed():
+                notifications_page = await browser_context.new_page()
+                notifications_page.set_default_timeout(30000)
+            page = notifications_page
+            try:
+                chats, my_id = await _enter_chat(page)
+                chat, err = _dm_pick(chats, user)
+                if err:
+                    return err
+                info = chat.get('info') or {}
+                name = info.get('user_name') or info.get('nickname') or ''
+                cap = {}
+                hist = []
+
+                async def on_resp(r):
+                    if '/api/im/web/messages/history' in r.url:
+                        try:
+                            cap['d'] = await r.json()
+                            hist.append(cap['d'])
+                        except Exception:
+                            pass
+                page.on('response', on_resp)
+                try:
+                    await asyncio.sleep(_random.uniform(0.8, 2))
+                    if not await _dm_open_conversation(page, name):
+                        return f"会话列表里没点到「{name}」"
+                    for _ in range(20):
+                        if cap.get('d'):
+                            break
+                        await asyncio.sleep(0.5)
+                finally:
+                    page.remove_listener('response', on_resp)
+                await asyncio.sleep(_random.uniform(2, 3.5))  # 多等一会，把页面补发的几次 history 请求都收齐
+            finally:
+                await _watch_leave_notifications(page)
+    except _RiskBlocked:
+        raise
+    except Exception as e:
+        return f"读取私信失败：{e}"
+    _seen, msgs = set(), []
+    for _d in hist:  # 合并所有 history 响应，按 uuid/id/时间去重
+        for _m in ((_d.get('data') or {}).get('out_message_list') or []):
+            _k = _m.get('id') or _m.get('uuid') or (_m.get('created_at'), _m.get('sender_id'))
+            if _k not in _seen:
+                _seen.add(_k)
+                msgs.append(_m)
+    if not msgs:
+        return f"和「{name}」的会话里没有读到消息"
+    msgs.sort(key=lambda m: m.get('created_at') or 0)
+    msgs = msgs[-limit:]
+    out = [f"和「{name}」的私信（最近 {len(msgs)} 条，该会话已被标记为已读）：", ""]
+    for m in msgs:
+        who = '我' if m.get('sender_id') == my_id else name
+        rv = ' (已撤回)' if m.get('revoked') else ''
+        out.append(f"[{_dm_time(m.get('created_at'))}] {who}：{_dm_text(m)}{rv}")
+    mine = _get_dm_history(chat.get('chat_user_id'), limit=3)
+    if mine:
+        out.append("\n（本地记录里我最近发给 TA 的：" + "；".join(f"{h['created_at'][5:16]}「{h['content'][:20]}」" for h in mine) + "）")
+    return "\n".join(out)
+
+
+@mcp.tool()
+async def send_chat(user: str, content: str, force: bool = False) -> str:
+    """给某人发私信。只能发给已有会话的人（不主动私信陌生人）。
+    ⚠️ 会点开会话，该会话会被标成已读。发之前最好先 read_chat 看看上下文。
+    10 分钟内给同一个人发过完全相同的内容会拦截，force=true 可强制。
+    换行：content 里的 \\n 会按 Shift+Enter 打成换行。
+
+    Args:
+        user: 对方昵称，或 get_chats 里给的 chat_user_id
+        content: 私信内容
+        force: 重复内容拦截时强制发送
+    """
+    content = (content or '').strip('\n')
+    if not content.strip():
+        return "内容为空"
+    _rl = _RateLimit.check('dm')
+    if _rl:
+        return _rl
+    if not await ensure_browser():
+        return "请先登录小红书账号"
+    global notifications_page
+    try:
+        async with _notif_page_lock:
+            if notifications_page is None or notifications_page.is_closed():
+                notifications_page = await browser_context.new_page()
+                notifications_page.set_default_timeout(30000)
+            page = notifications_page
+            sent = False
+            try:
+                chats, my_id = await _enter_chat(page)
+                chat, err = _dm_pick(chats, user)
+                if err:
+                    return err
+                cid = chat.get('chat_user_id')
+                info = chat.get('info') or {}
+                name = info.get('user_name') or info.get('nickname') or ''
+                if info.get('is_block'):
+                    return f"你已拉黑「{name}」，未发送"
+
+                # 重复拦截
+                _prefix = ''
+                _recent = [h for h in _get_dm_history(cid, limit=10)
+                           if h['content'].strip() == content.strip()
+                           and (datetime.now() - datetime.fromisoformat(h['created_at'])).total_seconds() < 600]
+                if _recent:
+                    if not force:
+                        return f"⚠️ 10 分钟内已给「{name}」发过完全相同的内容（{_recent[0]['created_at']}），未发送。确实要再发请传 force=true。"
+                    _prefix = "⚠️ 10 分钟内发过相同内容（force=true，本次仍已发送）\n"
+
+                await asyncio.sleep(_random.uniform(0.8, 2))
+                if not await _dm_open_conversation(page, name):
+                    return f"会话列表里没点到「{name}」"
+                await page.wait_for_selector('.xhs-im-input-bar-editor', timeout=10000)
+                await _rand_sleep(_random.uniform(2, 4))  # 先"看一眼"聊天记录
+                ed = await page.query_selector('.xhs-im-input-bar-editor')
+                await _human_click(page, ed)
+                await _rand_sleep(0.6)
+                if (await page.evaluate("() => (document.querySelector('.xhs-im-input-bar-editor')?.innerText || '').trim()")):
+                    await page.keyboard.press('Control+a')  # 清掉上次留下的草稿
+                    await page.keyboard.press('Delete')
+                    await asyncio.sleep(0.4)
+                # 换行用 Shift+Enter，Enter 是发送
+                parts = content.split('\n')
+                for i, part in enumerate(parts):
+                    if part:
+                        await _human_type(page, part)
+                    if i < len(parts) - 1:
+                        await page.keyboard.press('Shift+Enter')
+                        await asyncio.sleep(_random.uniform(0.3, 0.8))
+                await asyncio.sleep(_random.uniform(0.8, 2))
+
+                # ── 以下点了发送，出任何问题都不能再重发 ──
+                before = await page.evaluate("() => document.querySelectorAll('.chat-item__bubble--me').length")
+                # 私信是走 WebSocket 发的，被拒（如"禁止私信发言"）只在回包里说，页面上只剩一个红色感叹号 → 开个 CDP 会话收回包
+                _ws_reasons, _cdp = [], None
+                try:
+                    _cdp = await browser_context.new_cdp_session(page)
+                    await _cdp.send('Network.enable')
+
+                    def _on_ws_frame(e):
+                        try:
+                            d = e['response']['payloadData']
+                            if '"t":3' not in d:
+                                return
+                            import base64 as _b64
+                            raw = _b64.b64decode(json.loads(d)['b']['a']['b'])
+                            m = re.search(rb'"bizType":"[^"]*","content":"([^"]+)"', raw)
+                            if m:
+                                _ws_reasons.append(m.group(1).decode('utf-8', 'ignore'))
+                        except Exception:
+                            pass
+                    _cdp.on('Network.webSocketFrameReceived', _on_ws_frame)
+                except Exception:
+                    _cdp = None
+                await page.keyboard.press('Enter')  # 网页版私信没有发送按钮（action-btn 是表情），Enter 就是发送
+                sent = True
+                await _rand_sleep(3)
+                if _cdp:
+                    try:
+                        await _cdp.detach()
+                    except Exception:
+                        pass
+                _failed = await page.evaluate("() => !!document.querySelector('.chat-item__status-btn, .xhs-im-conv-item__status-icon')")
+                if _failed or _ws_reasons:
+                    _why = _ws_reasons[0].split('/')[0] if _ws_reasons else '页面把这条标成发送失败（红色感叹号）'
+                    return (f"❌ 发送失败：{_why}。这条没有发出去，未写入本地记录。\n"
+                            "页面上会留一条带红色感叹号的草稿气泡，不影响对方。请到小红书 App 查看账号的违规/限制详情。")
+                risk = await _detect_risk(page)
+                if risk:
+                    _RateLimit.trip(risk)
+                    _record_dm(cid, name, content)
+                    return f"🛑 发送后检测到风控（{risk}），已熔断。私信可能没发出去，请到浏览器里确认。"
+                left = await page.evaluate("() => (document.querySelector('.xhs-im-input-bar-editor')?.innerText || '').trim()")
+                after = await page.evaluate("() => document.querySelectorAll('.chat-item__bubble--me').length")
+                if left:
+                    return f"{_prefix}⚠️ 点了发送但输入框里还有内容，可能没发出去（未自动重试，避免重复，也未写入本地记录）：{left[:40]}"
+                _record_dm(cid, name, content)
+                _RateLimit.record('dm')
+                if after <= before:
+                    return f"{_prefix}⚠️ 点了发送，输入框已清空，但聊天区没看到新气泡，请到浏览器确认。（已记入本地记录）"
+                return f"{_prefix}✅ 已发送给「{name}」：{content}"
+            except Exception as e:
+                if sent:
+                    return f"⚠️ 已点击发送，之后出错：{e}。可能已经发出，请先 read_chat 确认，不要直接重发。"
+                raise
+            finally:
+                await _watch_leave_notifications(page)
+    except _RiskBlocked:
+        raise
+    except Exception as e:
+        return f"发送私信失败（未发送）：{e}"
+
+
+@mcp.tool()
+async def get_chat_history(user: str = "", limit: int = 20) -> str:
+    """查看我通过 send_chat 发出去的私信的本地记录（只记我发的，不含对方的消息）。
+
+    Args:
+        user: 对方的 chat_user_id；留空查所有人
+        limit: 最多返回条数
+    """
+    rows = _get_dm_history(user.strip(), limit=limit)
+    if not rows:
+        return "没有私信发送记录"
+    return "\n".join(f"[{r['created_at']}] → {r['user_name'] or r['chat_user_id']}：{r['content'][:80]}" for r in rows)
 
 
 if __name__ == "__main__":

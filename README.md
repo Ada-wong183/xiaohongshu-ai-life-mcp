@@ -8,8 +8,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
 ![MCP](https://img.shields.io/badge/MCP-FastMCP-8A2BE2)
-![Playwright](https://img.shields.io/badge/Playwright-CDP-2EAD33?logo=playwright&logoColor=white)
-![Tools](https://img.shields.io/badge/tools-20-ff2442)
+![Patchright](https://img.shields.io/badge/Patchright-CDP-2EAD33?logo=playwright&logoColor=white)
+![Tools](https://img.shields.io/badge/tools-25-ff2442)
 
 </div>
 
@@ -22,7 +22,7 @@
 
 | | |
 |---|---|
-| 🧭 **像人一样操作** | 连接的是你自己的真实 Chrome（CDP），鼠标轨迹、逐字打字、随机停顿、先看后评，全程拟人 |
+| 🧭 **像人一样操作** | 连接的是你自己的真实 Chrome（CDP，用 Patchright 去掉 `Runtime.enable` 的泄漏），贝塞尔鼠标轨迹、惯性滚动、按下-按住-松开式点击、逐字打字（大写和符号会先按 Shift）、随机停顿、先看后评，全程拟人 |
 | 🔔 **通知看门狗** | 不让 AI 定时轮询（费 token）。服务被动监听页面自带的未读数，有新评论/@/关注才唤醒 AI |
 | 💬 **站内回复** | 回复评论走"点侧栏通知入口 → 在通知页直接回"，和真人路径一致，找不到才退回笔记页 |
 | 📝 **能发笔记** | 本地图片、小红书内置文字配图、本地生成图片三种模式，话题标签自动选 |
@@ -34,7 +34,7 @@
 ```mermaid
 flowchart LR
     AI["🤖 AI 客户端<br/>Claude Code / Desktop"] -- MCP --> S["FastMCP 服务<br/>xiaohongshu_mcp.py"]
-    S -- Playwright / CDP --> C["🌐 真实 Chrome<br/>(持久化 profile)"]
+    S -- Patchright / CDP --> C["🌐 真实 Chrome<br/>(持久化 profile)"]
     C --> X["📕 小红书"]
     C -. "未读数轮询(被动监听)" .-> W["🔔 看门狗"]
     W -- "新通知" --> L["📄 唤醒日志<br/>xhs-wake-events.log"]
@@ -112,7 +112,7 @@ Claude Code 的 `~/.claude.json` 里加入：
 
 ---
 
-## 🧰 工具列表（20 个）
+## 🧰 工具列表（25 个）
 
 ### 账号与状态
 
@@ -127,7 +127,7 @@ Claude Code 的 `~/.claude.json` 里加入：
 |------|------|------|
 | `search_notes` | `keywords`, `limit=20`, `verbose=False` | 关键词搜索笔记 |
 | `list_feeds` | `limit=20`, `verbose=False` | 首页推荐信息流 |
-| `get_note_content` | `url`, `include_images=True` | 笔记正文 + 前 15 条评论；≤4 张图返回本地路径，>4 张用 Gemini 分析。链接缺 `xsec_token` 时自动用缓存补 |
+| `get_note_content` | `url`, `include_images=True`, `include_comments=True` | 笔记正文 + 前 15 条评论（`include_comments=False` 只取正文）；≤4 张图返回本地路径，>4 张用 Gemini 分析。链接缺 `xsec_token` 时自动用缓存补 |
 | `get_note_comments` | `url` | 完整评论列表（含楼中楼展开） |
 | `get_note_images` | `url` | 只取图片，不含正文 |
 | `get_notifications` | `tab="comments"`, `limit=20`, `only_unreplied=False`, `verbose=False` | 评论@ / 赞和收藏 / 新增关注；自动对照回复记录标"已回复" |
@@ -147,6 +147,17 @@ Claude Code 的 `~/.claude.json` 里加入：
 | `follow_user` | `user_id`, `xsec_token=""` | 先在对方主页逛一会儿再关注，已关注不重复点 |
 | `add_comment_history` | `note_id`, `content`, `action_type`, `comment_id` | 漏记时手动补录评论/回复历史 |
 | `get_comment_history` | `note_id=""`, `limit=20` | 查评论/回复历史（用来去重） |
+
+### 私信
+
+网页版私信只能操作已有会话，不会主动私信陌生人。
+
+| 工具 | 参数 | 说明 |
+|------|------|------|
+| `get_chats` | `limit=20` | 私信会话列表（对方昵称、最后一条消息、时间）。只看列表，不点开会话，不会标已读 |
+| `read_chat` | `user`, `limit=20` | 读和某人的聊天记录。⚠️ 会点开会话，页面会自动标已读，对方会看到"已读" |
+| `send_chat` | `user`, `content`, `force=False` | 给已有会话的人发私信；`\n` 按 Shift+Enter 换行；10 分钟内同一人同一内容默认拦截。⚠️ 同样会标已读 |
+| `get_chat_history` | `user=""`, `limit=20` | 本地记录：我通过 `send_chat` 发出去的私信（不含对方消息） |
 
 ### 发布与管理
 
