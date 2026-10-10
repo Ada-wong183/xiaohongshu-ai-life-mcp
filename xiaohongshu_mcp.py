@@ -110,6 +110,54 @@ def _analyze_images_with_gemini(image_paths: list, note_title: str = "") -> str:
     except Exception as e:
         return f"（Gemini 分析失败：{e}）"
 
+async def _browser_download_images(urls, save_dir, prefix="img"):
+    """用已登录的真 Chrome 下载图片（page 内 fetch，走 Chrome 自己的网络栈：真实 TLS 指纹、cookie、请求头），
+    不再用 Python requests 单独去拉 CDN。fetch 被 CORS 挡住时退回"新标签页直接打开图片 URL"取响应体。
+    返回本地路径列表，失败的那张是一条"下载失败: ..."字符串。图与图之间随机间隔，不是同时猛拉。"""
+    import base64
+    saved = []
+    for i, u in enumerate(urls):
+        if i:
+            await asyncio.sleep(_random.uniform(0.4, 1.4))
+        data, ct, err = None, "", ""
+        try:
+            r = await main_page.evaluate("""async (u) => {
+                const r = await fetch(u, {credentials: 'include'});
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const b = await r.blob();
+                const buf = new Uint8Array(await b.arrayBuffer());
+                let s = '';
+                for (let j = 0; j < buf.length; j += 0x8000)
+                    s += String.fromCharCode.apply(null, buf.subarray(j, j + 0x8000));
+                return {ct: b.type, b64: btoa(s)};
+            }""", u)
+            data, ct = base64.b64decode(r["b64"]), r.get("ct", "")
+        except Exception as e:
+            err = f"fetch: {e}"
+            try:
+                pg = await browser_context.new_page()
+                try:
+                    resp = await pg.goto(u, referer="https://www.xiaohongshu.com/", timeout=30000)
+                    if resp and resp.ok:
+                        data = await resp.body()
+                        ct = resp.headers.get("content-type", "")
+                    else:
+                        err += f"; goto: HTTP {resp.status if resp else '?'}"
+                finally:
+                    await pg.close()
+            except Exception as e2:
+                err += f"; goto: {e2}"
+        if data:
+            ext = "jpg" if "jpeg" in ct else ("png" if "png" in ct else ("webp" if "webp" in ct else (ct.split("/")[-1].split(";")[0] or "jpg")))
+            fp = os.path.join(save_dir, f"{prefix}_{i+1}.{ext}")
+            with open(fp, "wb") as f:
+                f.write(data)
+            saved.append(fp)
+        else:
+            saved.append(f"下载失败: {u} ({err})")
+    return saved
+
+
 def _image_blocks(paths, max_side=1024, limit=9):
     """把本地图片缩成 JPEG 后作为 MCP 图片内容返回（聊天端读不到本机路径，只能靠内联图片）。"""
     from fastmcp.utilities.types import Image as _McpImage
@@ -2394,21 +2442,7 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
 
                 if img_urls:
                     img_dir = tempfile.mkdtemp(prefix="xhs_imgs_")
-                    saved = []
-                    headers = {"Referer": "https://www.xiaohongshu.com/"}
-                    for i, u in enumerate(img_urls):
-                        try:
-                            r = requests.get(u, headers=headers, timeout=10)
-                            ext = "jpg"
-                            ct = r.headers.get("content-type", "")
-                            if "png" in ct: ext = "png"
-                            elif "webp" in ct: ext = "webp"
-                            p = os.path.join(img_dir, f"img_{i+1}.{ext}")
-                            with open(p, "wb") as f:
-                                f.write(r.content)
-                            saved.append(p)
-                        except Exception:
-                            pass
+                    saved = [x for x in await _browser_download_images(img_urls, img_dir, "img") if os.path.exists(x)]
 
                     if saved:
                         if len(saved) <= 4:
@@ -3088,23 +3122,9 @@ async def get_note_images(url: str) -> Any:
                 "message": "该笔记没有图片（可能是纯文字或视频笔记）"
             }
 
-        # 下载到本地临时目录（图片 CDN 不需要登录态）
+        # 用已登录的真 Chrome 下载（不再用 requests 单独拉 CDN）
         save_dir = tempfile.mkdtemp(prefix='xhs_images_')
-        img_headers = {"Referer": "https://www.xiaohongshu.com/",
-                       "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
-        saved_paths = []
-        for i, img_url in enumerate(image_urls):
-            try:
-                img_resp = await asyncio.to_thread(requests.get, img_url, headers=img_headers, timeout=15)
-                img_resp.raise_for_status()
-                ct = img_resp.headers.get('Content-Type', 'image/jpeg')
-                ext = 'jpg' if 'jpeg' in ct else ct.split('/')[-1].split(';')[0]
-                fname = os.path.join(save_dir, f'xhs_{i+1}.{ext}')
-                with open(fname, 'wb') as f:
-                    f.write(img_resp.content)
-                saved_paths.append(fname)
-            except Exception as e:
-                saved_paths.append(f"下载失败: {img_url} ({e})")
+        saved_paths = await _browser_download_images(image_urls, save_dir, 'xhs')
 
         _info = {
             "title": title, "author": author, "desc": desc,
