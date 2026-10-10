@@ -110,30 +110,60 @@ def _analyze_images_with_gemini(image_paths: list, note_title: str = "") -> str:
     except Exception as e:
         return f"（Gemini 分析失败：{e}）"
 
-async def _browser_download_images(urls, save_dir, prefix="img"):
-    """用已登录的真 Chrome 下载图片（page 内 fetch，走 Chrome 自己的网络栈：真实 TLS 指纹、cookie、请求头），
-    不再用 Python requests 单独去拉 CDN。fetch 被 CORS 挡住时退回"新标签页直接打开图片 URL"取响应体。
-    返回本地路径列表，失败的那张是一条"下载失败: ..."字符串。图与图之间随机间隔，不是同时猛拉。"""
-    import base64
-    saved = []
-    for i, u in enumerate(urls):
-        if i:
-            await asyncio.sleep(_random.uniform(0.4, 1.4))
-        data, ct, err = None, "", ""
+def _img_key(u: str) -> str:
+    """图片 URL 的稳定标识：去掉查询串和 !处理后缀，取最后一段文件名。"""
+    return (u or "").split("?")[0].split("!")[0].rstrip("/").split("/")[-1]
+
+
+def _start_img_capture(page, ttl: float = 120.0):
+    """在打开笔记页**之前**调用：监听页面自己加载图片时的响应，把响应体存下来。
+    这样配图不需要我们再发任何请求——和人手动看帖时浏览器下载的流量完全一样。
+    返回 (store, stop)。store: {文件名key: (bytes, content-type)}；ttl 秒后自动停止监听，stop() 可提前停。"""
+    store = {}
+    t0 = _time.time()
+
+    async def _on_resp(resp):
+        if _time.time() - t0 > ttl:
+            try:
+                page.remove_listener("response", _on_resp)
+            except Exception:
+                pass
+            return
         try:
-            r = await main_page.evaluate("""async (u) => {
-                const r = await fetch(u, {credentials: 'include'});
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                const b = await r.blob();
-                const buf = new Uint8Array(await b.arrayBuffer());
-                let s = '';
-                for (let j = 0; j < buf.length; j += 0x8000)
-                    s += String.fromCharCode.apply(null, buf.subarray(j, j + 0x8000));
-                return {ct: b.type, b64: btoa(s)};
-            }""", u)
-            data, ct = base64.b64decode(r["b64"]), r.get("ct", "")
-        except Exception as e:
-            err = f"fetch: {e}"
+            if resp.request.resource_type != "image" or "xhscdn" not in resp.url or not resp.ok:
+                return
+            body = await resp.body()
+            k = _img_key(resp.url)
+            if k and (k not in store or len(body) > len(store[k][0])):
+                store[k] = (body, resp.headers.get("content-type", ""))
+        except Exception:
+            pass
+
+    page.on("response", _on_resp)
+
+    def stop():
+        try:
+            page.remove_listener("response", _on_resp)
+        except Exception:
+            pass
+    return store, stop
+
+
+async def _browser_download_images(urls, save_dir, prefix="img", captured=None):
+    """保存配图。优先用页面加载时已被浏览器下载的响应（_start_img_capture 抓的，零额外请求）；
+    没抓到的那几张才补取：用新标签页直接打开图片 URL，带 Referer，逐张慢慢来。
+    返回本地路径列表，失败的那张是一条"下载失败: ..."字符串。"""
+    captured = captured or {}
+    saved = []
+    n_cap = n_tab = 0
+    for i, u in enumerate(urls):
+        data, ct, err = None, "", ""
+        hit = captured.get(_img_key(u))
+        if hit:
+            data, ct = hit
+            n_cap += 1
+        else:
+            await asyncio.sleep(_random.uniform(1.0, 2.5))
             try:
                 pg = await browser_context.new_page()
                 try:
@@ -141,12 +171,13 @@ async def _browser_download_images(urls, save_dir, prefix="img"):
                     if resp and resp.ok:
                         data = await resp.body()
                         ct = resp.headers.get("content-type", "")
+                        n_tab += 1
                     else:
-                        err += f"; goto: HTTP {resp.status if resp else '?'}"
+                        err = f"HTTP {resp.status if resp else '?'}"
                 finally:
                     await pg.close()
             except Exception as e2:
-                err += f"; goto: {e2}"
+                err = str(e2)[:120]
         if data:
             ext = "jpg" if "jpeg" in ct else ("png" if "png" in ct else ("webp" if "webp" in ct else (ct.split("/")[-1].split(";")[0] or "jpg")))
             fp = os.path.join(save_dir, f"{prefix}_{i+1}.{ext}")
@@ -155,6 +186,7 @@ async def _browser_download_images(urls, save_dir, prefix="img"):
             saved.append(fp)
         else:
             saved.append(f"下载失败: {u} ({err})")
+    print(f"[img] 共{len(urls)}张：页面已加载直接取 {n_cap} 张，补取（新标签页）{n_tab} 张", file=sys.stderr, flush=True)
     return saved
 
 
@@ -1882,6 +1914,7 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
         print(f"处理后的URL: {processed_url}")
         
         # 访问帖子链接，保留完整参数
+        _cap, _cap_stop = _start_img_capture(main_page, ttl=180.0)
         await main_page.goto(processed_url, timeout=60000)
         await asyncio.sleep(_random.uniform(12, 18))
         
@@ -2442,7 +2475,8 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
 
                 if img_urls:
                     img_dir = tempfile.mkdtemp(prefix="xhs_imgs_")
-                    saved = [x for x in await _browser_download_images(img_urls, img_dir, "img") if os.path.exists(x)]
+                    _cap_stop()
+                    saved = [x for x in await _browser_download_images(img_urls, img_dir, "img", _cap) if os.path.exists(x)]
 
                     if saved:
                         if len(saved) <= 4:
@@ -3060,6 +3094,7 @@ async def get_note_images(url: str) -> Any:
 
     try:
         processed_url = process_url(url)
+        _cap, _cap_stop = _start_img_capture(main_page)
         await main_page.goto(processed_url, timeout=60000)
         await asyncio.sleep(_random.uniform(4, 7))
 
@@ -3124,7 +3159,8 @@ async def get_note_images(url: str) -> Any:
 
         # 用已登录的真 Chrome 下载（不再用 requests 单独拉 CDN）
         save_dir = tempfile.mkdtemp(prefix='xhs_images_')
-        saved_paths = await _browser_download_images(image_urls, save_dir, 'xhs')
+        _cap_stop()
+        saved_paths = await _browser_download_images(image_urls, save_dir, 'xhs', _cap)
 
         _info = {
             "title": title, "author": author, "desc": desc,
