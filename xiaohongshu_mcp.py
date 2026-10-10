@@ -110,6 +110,26 @@ def _analyze_images_with_gemini(image_paths: list, note_title: str = "") -> str:
     except Exception as e:
         return f"（Gemini 分析失败：{e}）"
 
+def _image_blocks(paths, max_side=1024, limit=9):
+    """把本地图片缩成 JPEG 后作为 MCP 图片内容返回（聊天端读不到本机路径，只能靠内联图片）。"""
+    from fastmcp.utilities.types import Image as _McpImage
+    import io
+    from PIL import Image as _PILImage
+    out = []
+    for p in paths[:limit]:
+        try:
+            if not os.path.exists(p):
+                continue
+            with _PILImage.open(p) as im:
+                im = im.convert("RGB")
+                im.thumbnail((max_side, max_side))
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=82)
+            out.append(_McpImage(data=buf.getvalue(), format="jpeg"))
+        except Exception:
+            pass
+    return out
+
 # ── 反风控辅助函数 ────────────────────────────────────────────────────
 import random as _random
 
@@ -1788,7 +1808,7 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
         return f"搜索笔记时出错: {str(e)}"
 
 @mcp.tool()
-async def get_note_content(url: str, include_images: bool = True, include_comments: bool = True) -> str:
+async def get_note_content(url: str, include_images: bool = True, include_comments: bool = True) -> Any:
     """获取笔记正文、配图和前15条评论，一次调用返回完整内容。有笔记链接时首选此工具，不要用 search_notes 代替。
     支持完整链接（xiaohongshu.com/explore/...）和短链（xhslink.cn/...）。
     如需获取更多评论，再单独调用 get_note_comments。
@@ -1800,6 +1820,7 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
             >4张：调用 Gemini 3.6 Flash 分析图片，返回文字描述。
         include_comments: 是否顺带返回前15条评论（默认 True）。只想看正文、不需要评论时传 False。
     """
+    _attach_paths = []
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号"
@@ -2391,7 +2412,8 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
 
                     if saved:
                         if len(saved) <= 4:
-                            result += f"\n\n📷 配图（{len(saved)} 张，路径如下，可直接读取）：\n"
+                            _attach_paths = list(saved)
+                            result += f"\n\n📷 配图（{len(saved)} 张，已随结果以图片形式附上；本机路径如下，仅本地 CLI 可直接读取）：\n"
                             for p in saved:
                                 result += f"  {p}\n"
                         else:
@@ -2409,6 +2431,10 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
         except Exception:
             pass
 
+        if _attach_paths:
+            _imgs = _image_blocks(_attach_paths)
+            if _imgs:
+                return [result, *_imgs]
         return result
 
     except Exception as e:
@@ -2976,12 +3002,13 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
         return f"发布评论时出错: {str(e)}"
 
 @mcp.tool()
-def get_note_images(url: str) -> dict:
-    """仅获取笔记图片（不含正文）。通常不需要单独调用——get_note_content 已内置图片处理。
-    适用场景：只需要图片、不需要正文时。不需要登录，通过手机 UA 直接解析页面数据。
+async def get_note_images(url: str) -> Any:
+    """仅获取笔记图片（不含正文、评论）。通常不需要单独调用——get_note_content 已内置图片处理。
+    适用场景：只需要图片、不需要正文和评论时。走已登录的浏览器打开笔记页，
+    链接没带 xsec_token 时会自动用缓存补上（search_notes/list_feeds/通知看过的笔记都有缓存）。
 
     Args:
-        url: 笔记 URL（支持短链 xhslink.cn 和完整链接）
+        url: 笔记 URL（完整链接；带不带 xsec_token 都行，没带且缓存里也没有时可能被拦截）
 
     Returns:
         dict: 包含笔记基本信息和本地图片路径列表
@@ -2991,91 +3018,87 @@ def get_note_images(url: str) -> dict:
         return {"error": _rl}
     _RateLimit.record('image_fetch')
 
-    # 手机 UA，不用这个拿不到 __INITIAL_STATE__
-    headers = {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                      "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-                      "Mobile/15E148 Safari/604.1",
-        "Referer": "https://www.xiaohongshu.com/",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    }
+    login_status = await ensure_browser()
+    if not login_status:
+        return {"error": "请先登录小红书账号"}
+    if not main_page:
+        return {"error": "浏览器初始化失败，请重试"}
 
     try:
-        # 跟随短链跳转
-        resp = requests.get(url.strip(), headers=headers, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        html = resp.text
+        processed_url = process_url(url)
+        await main_page.goto(processed_url, timeout=60000)
+        await asyncio.sleep(_random.uniform(4, 7))
 
-        # 提取 __INITIAL_STATE__
-        match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});?\s*</script', html, re.S)
-        if not match:
-            # 有时 unicode 转义
-            html_unescaped = html.replace('\\u002F', '/').replace('\\u0026', '&')
-            match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});?\s*</script', html_unescaped, re.S)
+        # 被安全拦截 / 笔记不可见
+        cur = main_page.url
+        if '/404' in cur:
+            return {"error": "被小红书安全拦截（跳到了 404 页）。链接缺少有效的 xsec_token 且缓存里也没有；"
+                             "请先用 search_notes/list_feeds 看到这篇笔记，或传带 xsec_token 的完整链接。"}
+        _err = await main_page.evaluate('''() => {
+            for (const t of ["当前笔记暂时无法浏览", "内容不存在", "页面不存在", "内容已被删除"])
+                if (document.body.innerText.includes(t)) return t;
+            return "";
+        }''')
+        if _err:
+            return {"error": f"无法获取笔记: {_err}"}
 
-        if not match:
-            return {"error": "未找到 __INITIAL_STATE__，页面结构可能已变更或该链接需要登录"}
+        # 优先从页面状态里取（顺序准确、不会混进头像/推荐图）；取不到再退回 DOM
+        info = await main_page.evaluate('''() => {
+            const out = {title: "", author: "", desc: "", urls: []};
+            try {
+                const st = window.__INITIAL_STATE__;
+                const map = (st && st.note && st.note.noteDetailMap) || {};
+                const cur = st && st.note && st.note.currentNoteId;
+                const cur_id = (cur && (cur.value !== undefined ? cur.value : cur)) || "";
+                let item = map[cur_id] || Object.values(map)[0];
+                let note = item && (item.note || item);
+                if (note && note.imageList) {
+                    out.title = note.title || "";
+                    out.desc = note.desc || "";
+                    out.author = (note.user && note.user.nickname) || "";
+                    for (const im of note.imageList) {
+                        let u = im.urlDefault || im.url || ((im.infoList || [])[0] || {}).url || "";
+                        if (u.startsWith("//")) u = "https:" + u;
+                        if (u && !out.urls.includes(u)) out.urls.push(u);
+                    }
+                }
+            } catch (e) {}
+            if (!out.urls.length) {
+                const sels = ['.swiper-slide img', '.note-slider img', '.media-container img'];
+                for (const sel of sels)
+                    for (const img of document.querySelectorAll(sel)) {
+                        const src = img.src || img.dataset.src || '';
+                        if (src.startsWith('http') && !out.urls.includes(src)) out.urls.push(src);
+                    }
+                const t = document.querySelector('#detail-title'); if (t) out.title = t.innerText.trim();
+                const d = document.querySelector('#detail-desc'); if (d) out.desc = d.innerText.trim();
+                const a = document.querySelector('.author-wrapper .username, .author .name');
+                if (a) out.author = a.innerText.trim();
+            }
+            return out;
+        }''')
 
-        raw = match.group(1)
-        # 修复 undefined → null
-        raw = re.sub(r'\bundefined\b', 'null', raw)
-        raw = raw.replace('\\u002F', '/').replace('\\u0026', '&')
-
-        state = json.loads(raw)
-
-        # 兼容两种路径
-        note_data = None
-        try:
-            note_data = state['noteData']['data']['noteData']
-        except (KeyError, TypeError):
-            pass
-        if not note_data:
-            try:
-                note_data = state['noteData']['normalNotePreloadData']['noteData']
-            except (KeyError, TypeError):
-                pass
-
-        if not note_data:
-            return {"error": "无法从 __INITIAL_STATE__ 中解析笔记数据，路径可能已变更"}
-
-        # 基本信息
-        title = note_data.get('title', '')
-        desc = note_data.get('desc', '')
-        author = note_data.get('user', {}).get('nickname', '未知作者')
-
-        # 图片 URL 列表
-        image_list = note_data.get('imageList', [])
-        image_urls = []
-        for img in image_list:
-            img_url = img.get('urlDefault') or img.get('url') or img.get('infoList', [{}])[0].get('url', '')
-            if img_url:
-                if img_url.startswith('//'):
-                    img_url = 'https:' + img_url
-                image_urls.append(img_url)
+        image_urls = info.get('urls') or []
+        title, desc, author = info.get('title', ''), info.get('desc', ''), info.get('author', '') or '未知作者'
 
         if not image_urls:
             return {
-                "title": title,
-                "author": author,
-                "desc": desc,
-                "image_count": 0,
-                "image_paths": [],
+                "title": title, "author": author, "desc": desc,
+                "image_count": 0, "image_paths": [],
                 "message": "该笔记没有图片（可能是纯文字或视频笔记）"
             }
 
-        # 下载图片到本地临时目录（每次调用独立目录，避免多次调用互相覆盖）
+        # 下载到本地临时目录（图片 CDN 不需要登录态）
         save_dir = tempfile.mkdtemp(prefix='xhs_images_')
-
-        img_headers = {**headers, "Referer": "https://www.xiaohongshu.com/"}
+        img_headers = {"Referer": "https://www.xiaohongshu.com/",
+                       "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
         saved_paths = []
-
         for i, img_url in enumerate(image_urls):
             try:
-                img_resp = requests.get(img_url, headers=img_headers, timeout=15)
+                img_resp = await asyncio.to_thread(requests.get, img_url, headers=img_headers, timeout=15)
                 img_resp.raise_for_status()
-                # 判断后缀
-                content_type = img_resp.headers.get('Content-Type', 'image/jpeg')
-                ext = 'jpg' if 'jpeg' in content_type else content_type.split('/')[-1].split(';')[0]
+                ct = img_resp.headers.get('Content-Type', 'image/jpeg')
+                ext = 'jpg' if 'jpeg' in ct else ct.split('/')[-1].split(';')[0]
                 fname = os.path.join(save_dir, f'xhs_{i+1}.{ext}')
                 with open(fname, 'wb') as f:
                     f.write(img_resp.content)
@@ -3083,21 +3106,19 @@ def get_note_images(url: str) -> dict:
             except Exception as e:
                 saved_paths.append(f"下载失败: {img_url} ({e})")
 
-        return {
-            "title": title,
-            "author": author,
-            "desc": desc,
+        _info = {
+            "title": title, "author": author, "desc": desc,
             "image_count": len(image_urls),
             "image_paths": saved_paths,
-            "message": f"共 {len(saved_paths)} 张图片已保存到本地，路径见 image_paths"
+            "message": f"共 {len(saved_paths)} 张图片已保存到本地（路径仅本地可读），同时已以图片形式附在结果后面"
         }
+        _imgs = _image_blocks([p for p in saved_paths if os.path.exists(p)])
+        return [json.dumps(_info, ensure_ascii=False), *_imgs] if _imgs else _info
 
-    except requests.exceptions.RequestException as e:
-        return {"error": f"网络请求失败: {e}"}
-    except json.JSONDecodeError as e:
-        return {"error": f"JSON 解析失败: {e}"}
+    except _RiskBlocked:
+        raise
     except Exception as e:
-        return {"error": f"未知错误: {e}"}
+        return {"error": f"获取笔记图片出错: {e}"}
 
 
 @mcp.tool()
