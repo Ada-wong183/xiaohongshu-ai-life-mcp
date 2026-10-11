@@ -37,7 +37,7 @@ import patchright.async_api as _pr_api
 
 def _patch_main_world_eval():
     """patchright 的 evaluate 默认跑在隔离世界，读不到页面自己的全局变量（如 window.__INITIAL_STATE__、
-    我们 add_init_script 里存的 window.__shadowRoots）。本项目大量依赖这些，所以把所有 evaluate 类方法
+    页面状态之类）。本项目大量依赖这些，所以把所有 evaluate 类方法
     的 isolated_context 默认值改成 False（主世界，行为和原版 Playwright 一致）。调用方显式传值时尊重调用方。"""
     import functools
     for _cls in (_pr_api.Page, _pr_api.Frame, _pr_api.Locator, _pr_api.ElementHandle, _pr_api.JSHandle):
@@ -384,16 +384,47 @@ def _arm_page(page):
     page._risk_armed = True
 
 
+_ACTIVE_PAGE = None  # 最近一次被拟人函数操作过的页面，给 _rand_sleep 的停留漂移用
+
+
+async def _vp(page):
+    """真实可视区大小（innerWidth/innerHeight）。CDP 连真实 Chrome 时 page.viewport_size 是 None，
+    以前退回 1280x800，比真实窗口（常常只有 ~1000x500）大，鼠标目标点会落在可视区外面。"""
+    try:
+        w, h = await page.evaluate("() => [innerWidth, innerHeight]")
+        if w and h:
+            page._vp = {'width': int(w), 'height': int(h)}
+    except Exception:
+        pass
+    return getattr(page, "_vp", None) or page.viewport_size or {'width': 1000, 'height': 500}
+
+
+async def _dwell(page, secs: float):
+    """停留 secs 秒，但鼠标像真人那样微微漂移（实录：读帖时约 70~90% 的秒数里鼠标都有动，步长 2~3px）。"""
+    end = _time.time() + max(0.0, secs)
+    try:
+        x, y = _mouse_pos(page)
+        while _time.time() < end:
+            await asyncio.sleep(min(max(0.0, end - _time.time()), _random.uniform(0.25, 0.9)))
+            if _time.time() >= end:
+                break
+            x += _random.uniform(-9, 9); y += _random.uniform(-7, 7)
+            await page.mouse.move(x, y)
+            page._mpos = (x, y)
+    except Exception:
+        await asyncio.sleep(max(0.0, end - _time.time()))
+
+
 async def _skim(page):
     """打开笔记后先看一会儿：随机滚两三下再回来，避免"一打开就评论"。"""
     try:
-        vp = page.viewport_size or {'width': 1280, 'height': 800}
+        vp = await _vp(page)
         await _human_move(page, vp['width'] * _random.uniform(0.35, 0.6), vp['height'] * _random.uniform(0.35, 0.6))
-        await _rand_sleep(_random.uniform(3, 6))
+        await _dwell(page, _random.uniform(3, 6))
         for _ in range(_random.randint(2, 3)):
             await _human_wheel(page, _random.randint(200, 550))
-            await _rand_sleep(_random.uniform(1.5, 4))
-        if _random.random() < 0.6:
+            await _dwell(page, _random.uniform(1.5, 4))
+        if _random.random() < 0.15:  # 真人读笔记几乎不往回滚（实录 0%）
             await _human_wheel(page, -_random.randint(150, 400))
             await _rand_sleep(_random.uniform(1, 2.5))
     except Exception:
@@ -404,29 +435,29 @@ async def _idle_hover(page):
     """停在页面上看东西时，鼠标不会一动不动：随机漂移 1~3 次（幅度不大），偶尔轻轻滚一下。
     给看门狗看通知用——进了通知页之后以前只是干等几秒，页面上没有任何鼠标活动。"""
     try:
-        vp = page.viewport_size or {'width': 1280, 'height': 800}
+        vp = await _vp(page)
         x0, y0 = _mouse_pos(page)
         for _ in range(_random.randint(1, 3)):
             nx = min(max(x0 + _random.uniform(-220, 220), 40), vp['width'] - 40)
             ny = min(max(y0 + _random.uniform(-160, 160), 80), vp['height'] - 40)
             await _human_move(page, nx, ny)
             x0, y0 = nx, ny
-            await asyncio.sleep(_random.uniform(0.6, 2.2))
+            await _dwell(page, _random.uniform(0.6, 2.2))
         if _random.random() < 0.35:
             await _human_wheel(page, _random.randint(80, 260))
-            await asyncio.sleep(_random.uniform(0.8, 2.0))
+            await _dwell(page, _random.uniform(0.8, 2.0))
             if _random.random() < 0.6:
                 await _human_wheel(page, -_random.randint(60, 200))
-                await asyncio.sleep(_random.uniform(0.5, 1.5))
+                await _dwell(page, _random.uniform(0.5, 1.5))
     except Exception:
         pass
 
 
 def _mouse_pos(page):
-    """记住鼠标上次停在哪（Playwright 不告诉我们），第一次用视口中间附近的随机点。"""
+    """记住鼠标上次停在哪（Playwright 不告诉我们），第一次用视口中间附近的随机点。（同步函数，读 _vp 缓存）"""
     p = getattr(page, "_mpos", None)
     if p is None:
-        vp = page.viewport_size or {'width': 1280, 'height': 800}
+        vp = getattr(page, "_vp", None) or page.viewport_size or {'width': 1000, 'height': 500}
         p = (vp['width'] * _random.uniform(0.3, 0.7), vp['height'] * _random.uniform(0.3, 0.7))
         page._mpos = p
     return p
@@ -439,6 +470,8 @@ async def _human_move(page, x: float, y: float):
     - 沿途带细微抖动，越靠近目标抖得越小；总时长随距离按 Fitts 定律增长
     - 距离远时有 30% 概率先冲过头一点，再回拉修正
     - 全程用同一个"当前位置"，不会从一个点瞬移到另一个点"""
+    global _ACTIVE_PAGE
+    _ACTIVE_PAGE = page
     x0, y0 = _mouse_pos(page)
     x, y = float(x), float(y)
     dist = math.hypot(x - x0, y - y0)
@@ -475,7 +508,7 @@ async def _human_move(page, x: float, y: float):
             await page.mouse.move(bxs, bys)
             await asyncio.sleep(max(0.004, dur / n * _random.uniform(0.7, 1.3)))
 
-    dur = min(1.7, 0.16 + 0.12 * math.log2(dist / 30 + 1)) * _random.uniform(0.8, 1.35)
+    dur = min(1.0, 0.08 + 0.05 * math.log2(dist / 30 + 1)) * _random.uniform(0.75, 1.25)
     if dist > 250 and _random.random() < 0.3:
         over = _random.uniform(8, 24)
         ox = x + (x - x0) / dist * over + _random.uniform(-4, 4)
@@ -489,25 +522,172 @@ async def _human_move(page, x: float, y: float):
 
 
 async def _human_wheel(page, dy: float):
-    """滚动 dy 像素，拆成一串递减的小滚轮（像触控板/滚轮的惯性），而不是一次整格跳。
-    正数向下，负数向上；偶尔在末尾回弹一小段。总和严格等于 dy。"""
+    """用真鼠标滚轮的方式滚 dy 像素。依据真人外接鼠标实录（19 项操作）：
+    - 每格 deltaY 固定 ±120；
+    - 读东西时一次只滚 1~2 格（中位 1），两次之间隔约 0.5~1.5 秒；快速翻页时才一串 6~7 格（间隔约 25ms）。
+    所以：格数 = round(|dy|/120)（至少 1 格），小于 6 格时拆成 1~3 格的小串，串间停 0.4~1.2 秒；
+    6 格及以上当作快速翻页，6~7 格一串，串间停 0.3~0.6 秒。正数向下，负数向上。"""
     total = int(dy)
     if total == 0:
         return
     sign = 1 if total > 0 else -1
-    mag = abs(total)
-    n = max(3, min(14, mag // 55 + _random.randint(1, 3)))
-    w = [(1.0 - i / (n + 1)) ** 1.6 * _random.uniform(0.8, 1.2) + 0.1 for i in range(n)]
-    sw = sum(w)
-    parts = [int(mag * wi / sw) for wi in w]
-    parts[0] += mag - sum(parts)
-    for i, p in enumerate(parts):
-        if p:
-            await page.mouse.wheel(0, sign * p)
-        await asyncio.sleep(_random.uniform(0.012, 0.045) * (1 + i * 0.12))
-    if mag > 250 and _random.random() < 0.2:
-        await asyncio.sleep(_random.uniform(0.1, 0.3))
-        await page.mouse.wheel(0, -sign * _random.randint(8, 40))
+    ticks = max(1, int(round(abs(total) / 120.0)))
+    fast = ticks >= 6
+    done = 0
+    while done < ticks:
+        if fast:
+            burst = min(ticks - done, _random.randint(6, 7))
+            gap_in = (0.015, 0.04)
+        else:
+            burst = min(ticks - done, _random.choices([1, 2, 3], [50, 35, 15])[0])
+            gap_in = (0.03, 0.12)
+        for _ in range(burst):
+            await page.mouse.wheel(0, sign * 120)
+            await asyncio.sleep(_random.uniform(*gap_in))
+        done += burst
+        if done < ticks:
+            await asyncio.sleep(_random.uniform(0.3, 0.6) if fast else _random.uniform(0.4, 1.2))
+
+
+async def _wheel_by(page, dy: float):
+    """用真滚轮滚动 dy 像素（正数向下）。鼠标还没在这个页面上动过时，先像人一样把鼠标挪到内容区再滚。
+    取代 window.scrollBy/scrollTo：JS 滚动只有 scroll 事件、没有 wheel/鼠标事件，页面能看出来。"""
+    try:
+        vp = await _vp(page)
+        mp = getattr(page, "_mpos", None)
+        # 鼠标没动过，或停在内容区之外（顶栏/侧栏/页面外/关弹窗的按钮上）：先像人一样把鼠标挪到内容上再滚
+        if mp is None or not (vp['width'] * 0.2 <= mp[0] <= vp['width'] * 0.8 and vp['height'] * 0.25 <= mp[1] <= vp['height'] * 0.85):
+            await _human_move(page, vp['width'] * _random.uniform(0.3, 0.7), vp['height'] * _random.uniform(0.35, 0.7))
+        await _human_wheel(page, dy)
+    except Exception:
+        pass
+
+
+async def _wheel_to_bottom(page, max_steps: int = 8):
+    """用真滚轮一段一段往下滚，到底或连续两次滚不动就停（至少滚一次）。"""
+    stuck = 0
+    for _ in range(max_steps):
+        try:
+            y0 = await page.evaluate("() => scrollY")
+        except Exception:
+            y0 = None
+        await _wheel_by(page, _random.randint(450, 900))
+        await asyncio.sleep(_random.uniform(0.4, 1.2))
+        try:
+            st = await page.evaluate("() => ({y: scrollY, h: document.documentElement.scrollHeight, ih: innerHeight})")
+        except Exception:
+            break
+        if y0 is not None and abs(st['y'] - y0) < 2:
+            stuck += 1
+            if stuck >= 2:
+                break
+        else:
+            stuck = 0
+        if st['y'] + st['ih'] >= st['h'] - 8:
+            break
+
+
+async def _wheel_to_top(page, max_steps: int = 8):
+    """用真滚轮一段一段往回滚到顶部。"""
+    for _ in range(max_steps):
+        try:
+            y = await page.evaluate("() => scrollY")
+        except Exception:
+            break
+        if y <= 5:
+            break
+        await _wheel_by(page, -min(y, _random.randint(500, 1000)))
+        await asyncio.sleep(_random.uniform(0.3, 0.9))
+
+
+async def _wheel_over_selector(page, selector: str, dy: float):
+    """把鼠标挪到某个滚动容器上再用真滚轮滚（容器里的滚动只响应鼠标所在位置的滚轮）。找不到容器就直接滚页面。"""
+    try:
+        el = await page.query_selector(selector)
+        box = await el.bounding_box() if el else None
+        if box and box['width'] > 50 and box['height'] > 50:
+            await _human_move(page, box['x'] + box['width'] * _random.uniform(0.35, 0.65),
+                              box['y'] + min(box['height'], 700) * _random.uniform(0.35, 0.65))
+        await _wheel_by(page, dy)
+    except Exception:
+        pass
+
+
+async def _wheel_into_view(el, **_kw):
+    """用真滚轮把元素滚到视口中间附近。取代 scroll_into_view_if_needed（它是程序化滚动，没有 wheel 事件）。
+    滚不动（元素在内部滚动容器里、鼠标又不在上面）时，最后才退回原来的程序化滚动，保证功能不退化。"""
+    try:
+        pg = None
+        try:
+            pg = el.page          # Locator
+        except Exception:
+            pg = None
+        if pg is None:
+            fr = await el.owner_frame()   # ElementHandle
+            pg = fr.page if fr else None
+        if pg is None:
+            raise RuntimeError("no page")
+        last_y = None
+        for _ in range(4):
+            box = await el.bounding_box()
+            if not box:
+                break
+            ih = await pg.evaluate("() => innerHeight")
+            if 80 <= box['y'] and box['y'] + min(box['height'], ih * 0.3) <= ih - 80:
+                return
+            if last_y is not None and abs(box['y'] - last_y) < 2:
+                break               # 滚了没动
+            last_y = box['y']
+            dy = box['y'] + min(box['height'], ih * 0.3) / 2 - ih * _random.uniform(0.35, 0.55)
+            await _wheel_by(pg, max(-1200, min(1200, dy)))
+            await asyncio.sleep(_random.uniform(0.2, 0.5))
+        else:
+            return
+    except Exception:
+        pass
+    try:
+        await getattr(el, "scroll_into_view_if_needed")(timeout=3000)
+    except Exception:
+        pass
+
+
+async def _pierce_center(page, host_css: str, inner_css_list):
+    """取"藏在 closed shadow DOM 里的元素"的屏幕中心坐标，全程不往页面里注入任何脚本。
+    做法：走 Chrome 调试协议的 DOM 域——getDocument(pierce=True) 能看到 closed shadow root，
+    在 shadow root 内按选择器查到元素后，用 getBoxModel 取它的盒模型中心（视口坐标）。
+    找不到返回 None。页面上的 JS 看不到我们读过什么。"""
+    cdp = None
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        doc = await cdp.send("DOM.getDocument", {"depth": -1, "pierce": True})
+        host = await cdp.send("DOM.querySelector", {"nodeId": doc["root"]["nodeId"], "selector": host_css})
+        if not host.get("nodeId"):
+            return None
+        desc = await cdp.send("DOM.describeNode", {"nodeId": host["nodeId"], "depth": 1, "pierce": True})
+        roots = desc["node"].get("shadowRoots") or []
+        for root in roots:
+            pushed = await cdp.send("DOM.pushNodesByBackendIdsToFrontend", {"backendNodeIds": [root["backendNodeId"]]})
+            rid = pushed["nodeIds"][0]
+            for sel in inner_css_list:
+                hit = await cdp.send("DOM.querySelector", {"nodeId": rid, "selector": sel})
+                if not hit.get("nodeId"):
+                    continue
+                box = await cdp.send("DOM.getBoxModel", {"nodeId": hit["nodeId"]})
+                q = box["model"]["content"]          # 8 个数：四个角的 x,y
+                xs, ys = q[0::2], q[1::2]
+                w, h = max(xs) - min(xs), max(ys) - min(ys)
+                if w > 0 and h > 0:
+                    return [min(xs) + w / 2, min(ys) + h / 2]
+        return None
+    except Exception as e:
+        print(f"[pierce] 穿透取坐标失败：{str(e)[:100]}", file=sys.stderr, flush=True)
+        return None
+    finally:
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
 
 
 async def _human_click(page, element=None, x: float = None, y: float = None):
@@ -515,7 +695,7 @@ async def _human_click(page, element=None, x: float = None, y: float = None):
     try:
         if element is not None:
             try:  # 原版 element.click() 会先把元素滚进可视区，这里要补上，否则鼠标会点到屏幕外
-                await element.scroll_into_view_if_needed(timeout=3000)
+                await _wheel_into_view(element)
             except Exception:
                 pass
             box = await element.bounding_box()
@@ -529,7 +709,7 @@ async def _human_click(page, element=None, x: float = None, y: float = None):
         else:
             return
         await _human_move(page, cx, cy)
-        await asyncio.sleep(_random.uniform(0.08, 0.28))  # 到位后停一下再按
+        await asyncio.sleep(_random.uniform(0.02, 0.10))  # 到位后停一下再按（真人实测中位约60ms）
         await page.mouse.down()
         await asyncio.sleep(_random.uniform(0.04, 0.13))   # 按住一小会儿
         await page.mouse.up()
@@ -546,7 +726,17 @@ async def _rand_sleep(base: float, jitter: float = 0.4):
     实际等待时间 = base ± (base × jitter)
     """
     delta = base * jitter
-    await asyncio.sleep(max(0.1, base + _random.uniform(-delta, delta)))
+    t = max(0.1, base + _random.uniform(-delta, delta))
+    # 等得久（>=1.5s）且鼠标已在页面上动过：停留期间鼠标微漂移，不要一动不动（真人实录）
+    pg = _ACTIVE_PAGE
+    if t >= 1.5 and pg is not None and getattr(pg, "_mpos", None) is not None:
+        try:
+            if not pg.is_closed():
+                await _dwell(pg, t)
+                return
+        except Exception:
+            pass
+    await asyncio.sleep(t)
 
 _CJK_RE = re.compile(r'[㐀-鿿豈-﫿]')
 
@@ -555,9 +745,12 @@ _NL_MARK = "\u2424"  # ␤：评论里的换行占位符。网页端发送时会
 
 
 async def _ensure_nl_route(page):
-    """给页面装一个只作用于 comment/post 请求的拦截：把请求体里的占位符换成真换行。
+    """【已停用 2026-10-11】原先拦截 comment/post 请求改写请求体（占位符→\\n）。改写发生在前端签名之后，
+    签名与内容对不上，且网页端真人打不出评论换行，是"被篡改/非正常界面输入"的硬痕迹。现在评论里的换行一律换成空格，不再装任何拦截。
+    （以下是旧说明）给页面装一个只作用于 comment/post 请求的拦截：把请求体里的占位符换成真换行。
     网页端 JS 提交评论时会把输入框里的换行去掉，但服务器认 \\n（手机 App 就是这么发的）。
     每个页面只装一次；请求体里没有占位符时原样放行。"""
+    return  # 停用：不再装 page.route
     if getattr(page, "_nl_route_on", False):
         return
     async def _h(route):
@@ -591,6 +784,82 @@ async def _key_char(page, ch: str):
         await page.keyboard.up('Shift')
 
 
+async def _paste_text(page, text: str) -> bool:
+    """像真人那样粘贴：先把文字放进系统剪贴板（xclip），再按 Ctrl+V——页面会看到真实的
+    Ctrl 与 V 的 keydown/keyup、paste 事件和 inputType=insertFromPaste，而不是凭空出现的 insertText。
+    会临时占用剪贴板，粘完尽量还原。失败返回 False（调用方退回 insert_text）。"""
+    import subprocess as _sp
+    try:
+        env = dict(os.environ, DISPLAY=os.environ.get("DISPLAY") or ":0")
+        prev = None
+        try:
+            r = _sp.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, timeout=2, env=env)
+            if r.returncode == 0:
+                prev = r.stdout
+        except Exception:
+            pass
+        _sp.run(["xclip", "-selection", "clipboard", "-i"], input=text.encode("utf-8"), timeout=3, env=env,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        await asyncio.sleep(_random.uniform(0.15, 0.4))
+        await page.keyboard.press("Control+V", delay=_random.uniform(60, 130))
+        await asyncio.sleep(_random.uniform(0.3, 0.6))
+        if prev is not None:
+            try:
+                _sp.run(["xclip", "-selection", "clipboard", "-i"], input=prev, timeout=3, env=env,
+                        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        print(f"[paste] 剪贴板粘贴失败，退回 insert_text: {e}")
+        return False
+
+
+async def _ime_cdp(page):
+    """给页面拿一个只用于 Input 域的 CDP 会话（不 enable 任何域，缓存在 page 上）。"""
+    sess = getattr(page, "_ime_sess", None)
+    if sess is None:
+        sess = await page.context.new_cdp_session(page)
+        page._ime_sess = sess
+    return sess
+
+
+async def _ime_type_group(page, hanzi: str) -> bool:
+    """像真人用拼音输入法打一组汉字（真人实录：页面看到的是 keydown key='Process' keyCode=229，
+    keyup 才是真实字母；组词过程有 composition 事件；空格/数字键选词上屏）。
+    每个拼音字母：keyDown(Process,229) → imeSetComposition(已打字母) → keyUp(字母)；
+    最后：keyDown(Process,Space,229) → insertText(汉字) 上屏 → keyUp(空格)。
+    出错（缺 pypinyin / CDP 失败）返回 False，调用方退回 insert_text。"""
+    try:
+        from pypinyin import lazy_pinyin
+        letters = "".join(lazy_pinyin(hanzi)).lower()
+        if not letters or not letters.isascii() or not letters.isalpha():
+            return False
+        sess = await _ime_cdp(page)
+        shown = ""
+        for ch in letters:
+            code = "Key" + ch.upper()
+            await sess.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": "Process", "code": code,
+                                                       "windowsVirtualKeyCode": 229, "nativeVirtualKeyCode": 229})
+            shown += ch
+            await sess.send("Input.imeSetComposition", {"text": shown, "selectionStart": len(shown), "selectionEnd": len(shown)})
+            await asyncio.sleep(_random.uniform(0.07, 0.13))
+            await sess.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": ch, "code": code,
+                                                       "windowsVirtualKeyCode": ord(ch.upper()), "nativeVirtualKeyCode": ord(ch.upper())})
+            await asyncio.sleep(max(0.03, _random.lognormvariate(-2.5, 0.5)))  # 按键周期（按住0.1+此间隔）中位约 0.18s，与真人实录 185ms 一致
+        await asyncio.sleep(_random.uniform(0.15, 0.6))  # 看一眼候选词
+        await sess.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": "Process", "code": "Space",
+                                                   "windowsVirtualKeyCode": 229, "nativeVirtualKeyCode": 229})
+        await sess.send("Input.insertText", {"text": hanzi})
+        await asyncio.sleep(_random.uniform(0.07, 0.13))
+        await sess.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": " ", "code": "Space",
+                                                   "windowsVirtualKeyCode": 32, "nativeVirtualKeyCode": 32})
+        return True
+    except Exception as e:
+        print(f"[ime] 拼音输入失败，退回 insert_text: {e}")
+        return False
+
+
 async def _human_type(page, text: str, wpm: int = None, soft_newline: bool = False):
     """模拟真人输入中文。
     - 汉字按 1~4 字一组用 insert_text 上屏（像输入法选词提交），每组之间 0.5~1.5 秒，约 2~3 字/秒
@@ -599,11 +868,15 @@ async def _human_type(page, text: str, wpm: int = None, soft_newline: bool = Fal
     - 超过 200 字的长文按段落上屏（像从草稿粘贴过来），避免一篇笔记敲十几分钟
     soft_newline=True 时换行打占位符 _NL_MARK（评论框里单按 Enter 会直接发送，网页端也会吞真换行；调用方需先 _ensure_nl_route）。
     wpm 参数保留只为兼容旧调用，已不使用。"""
+    if soft_newline:  # 评论：网页端真人打不出换行，换行一律折成一个空格，不再用占位符+改请求体
+        text = re.sub(r'[ \t]*\n[ \t\n]*', ' ', text)
+        soft_newline = False
     if len(text) > 200:
         lines = text.split('\n')
         for i, line in enumerate(lines):
             if line:
-                await page.keyboard.insert_text(line)
+                if not await _paste_text(page, line):
+                    await page.keyboard.insert_text(line)
                 await asyncio.sleep(_random.uniform(0.8, 2.5))
             if i < len(lines) - 1:
                 await (page.keyboard.insert_text(_NL_MARK) if soft_newline else page.keyboard.press('Enter'))
@@ -623,8 +896,9 @@ async def _human_type(page, text: str, wpm: int = None, soft_newline: bool = Fal
             target = _random.choice((1, 2, 2, 2, 3, 3, 4))
             while j < n and j - i < target and _CJK_RE.match(text[j]):
                 j += 1
-            await page.keyboard.insert_text(text[i:j])
-            await asyncio.sleep(_random.uniform(0.5, 1.5))
+            if not await _ime_type_group(page, text[i:j]):
+                await page.keyboard.insert_text(text[i:j])
+            await asyncio.sleep(_random.uniform(0.3, 1.2))
             i = j
         elif ch in '。，！？、；：…“”‘’（）《》～—':
             await page.keyboard.insert_text(ch)
@@ -791,7 +1065,7 @@ async def _quick_comments(page, limit: int = 15) -> str:
 
         # 降级：滚动一下再 DOM 抓
         for _ in range(3):
-            await page.evaluate("window.scrollBy(0, 600)")
+            await _wheel_by(page, 600)
             await asyncio.sleep(0.7)
 
         items = await page.evaluate("""(limit) => {
@@ -980,10 +1254,13 @@ def _add_cached_token(url: str) -> str:
 _EXPAND_REPLY_RE = "text=/展开\\s*\\d*\\s*条回复|展开更多回复|查看更多回复/"
 
 
-async def _expand_replies(page, rounds: int = 6) -> int:
-    """点开所有折叠的楼中楼（"展开 N 条回复"）。返回点击次数。"""
+async def _expand_replies(page, rounds: int = 3, max_clicks: int = 8) -> int:
+    """点开折叠的楼中楼（"展开 N 条回复"），最多点 max_clicks 个（真人不会把几百条回复全点开，
+    而且每点一次都要走拟人滚动+拟人点击，全点会非常慢）。返回点击次数。"""
     clicked = 0
     for _ in range(rounds):
+        if clicked >= max_clicks:
+            break
         btns = page.locator(_EXPAND_REPLY_RE)
         try:
             n = await btns.count()
@@ -993,13 +1270,15 @@ async def _expand_replies(page, rounds: int = 6) -> int:
             break
         progressed = False
         for i in range(n):
+            if clicked >= max_clicks:
+                break
             try:
                 b = btns.nth(i)
-                await b.scroll_into_view_if_needed(timeout=2000)
-                await b.click(timeout=2000)
+                eh = await b.element_handle(timeout=2000)
+                await _human_click(page, element=eh)  # 内含拟人滚动入视口 + 拟人鼠标轨迹（原来是 Playwright 瞬移点击）
                 clicked += 1
                 progressed = True
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(_random.uniform(0.8, 1.6))
             except Exception:
                 continue
         if not progressed:
@@ -1079,15 +1358,17 @@ async def _ensure_chrome_running():
         return
     env = os.environ.copy()
     env.setdefault("DISPLAY", ":0")
+    # 这台机器的核显(Intel Ironlake)只有 OpenGL 2.1，Chrome 用不了 → WebGL 整个没有，是很可疑的环境特征。
+    # 让 Chrome 走独显(NVIDIA GT 415M / nouveau，OpenGL 4.3)，WebGL/GPU 合成就都有了（2026-10-11 本机实测）。
+    env.setdefault("DRI_PRIME", "1")
     subprocess.Popen(
         [
             "/usr/bin/google-chrome",
             f"--remote-debugging-port={CDP_PORT}",
             f"--user-data-dir={BROWSER_DATA_DIR}",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
             "--no-first-run",
             "--no-default-browser-check",
+            "--start-maximized",   # 真人几乎都是最大化用；窗口小（可视区只有 ~1000x500）本身就是个不像人的地方
         ],
         env=env,
         stdout=subprocess.DEVNULL,
@@ -1162,15 +1443,7 @@ async def ensure_browser(_from_idle: bool = False):
         browser_context.on("response", _watch_on_response)
 
         # 注入 attachShadow 拦截器，使 closed shadow root 也可被访问
-        await browser_context.add_init_script("""
-            window.__shadowRoots = new WeakMap();
-            const _orig = Element.prototype.attachShadow;
-            Element.prototype.attachShadow = function(init) {
-                const shadow = _orig.call(this, init);
-                window.__shadowRoots.set(this, shadow);
-                return shadow;
-            };
-        """)
+        # （不再往任何页面注入脚本：发布按钮在 closed shadow 里，改由 _pierce_center 走调试协议穿透读取）
 
         if browser_context.pages:
             main_page = browser_context.pages[0]
@@ -1335,8 +1608,14 @@ _notif_page_lock = asyncio.Lock()  # 常驻通知页同一时间只给一个人�
 
 
 async def _enter_notifications(page):
-    """先让常驻页面停在站内普通页面，再点侧栏通知入口进通知页（看门狗和回复共用）。"""
-    if 'xiaohongshu.com' not in page.url or '/notification' in page.url:
+    """先让页面停在站内普通页面，再点侧栏通知入口进通知页（看门狗、回复、get_notifications 共用，都在同一个主标签页里）。"""
+    if re.search(r'/explore/[0-9a-f]{20,}', page.url or ''):  # 停在笔记弹窗上：先像真人一样按 Esc 关掉
+        try:
+            await page.keyboard.press('Escape')
+            await asyncio.sleep(_random.uniform(1.0, 2.0))
+        except Exception:
+            pass
+    if 'xiaohongshu.com' not in page.url or '/notification' in page.url or re.search(r'/explore/[0-9a-f]{20,}', page.url or ''):
         await page.goto("https://www.xiaohongshu.com/explore", timeout=30000)
         await asyncio.sleep(_random.uniform(3, 6))
     else:
@@ -1367,16 +1646,15 @@ async def _watch_fetch(delay: float = 0, include_follows: bool = True):
             await asyncio.sleep(delay)
         if _RateLimit.breaker_message() or not browser_context:
             return
-        if _time.time() - _last_tool_ts < 60:  # 刚有工具在用浏览器，别抢常驻页面，下次再看
+        if _time.time() - _last_tool_ts < 240:  # 刚有工具在用浏览器，别抢常驻页面，下次再看
             return
         if _notif_page_lock.locked():  # 回复正在用常驻页面，这轮不抢
             return
         async with _notif_page_lock:
             _watch_last_fetch = _time.time()
-            if notifications_page is None or notifications_page.is_closed():
-                notifications_page = await browser_context.new_page()
-                notifications_page.set_default_timeout(30000)
-            page = notifications_page
+            if not main_page or main_page.is_closed():
+                return  # 主标签页不在，这轮不做
+            page = main_page
             await _enter_notifications(page)
             await asyncio.sleep(_random.uniform(2, 4))
             await _idle_hover(page)  # 看通知时鼠标随手动一动
@@ -1511,17 +1789,16 @@ async def _watch_dm_check(delay: float = 0, retries: int = 0):
         for attempt in range(retries + 1):
             if _RateLimit.breaker_message() or not browser_context:
                 return
-            if _time.time() - _last_tool_ts < 60 or _notif_page_lock.locked():  # 工具/回复在用页面，等一会儿再来
+            if _time.time() - _last_tool_ts < 240 or _notif_page_lock.locked():  # 工具/回复在用页面，等一会儿再来
                 if attempt < retries:
                     await asyncio.sleep(_random.uniform(60, 120))
                     continue
                 return
             break
         async with _notif_page_lock:
-            if notifications_page is None or notifications_page.is_closed():
-                notifications_page = await browser_context.new_page()
-                notifications_page.set_default_timeout(30000)
-            page = notifications_page
+            if not main_page or main_page.is_closed():
+                return  # 主标签页不在，这轮不做
+            page = main_page
             cap = {'unread': None, 'chats': []}
 
             async def on_resp(r):
@@ -1602,7 +1879,7 @@ async def _idle_session():
         for _ in range(_random.randint(4, 9)):
             if _idle_should_stop():
                 break
-            vp = page.viewport_size or {'width': 1280, 'height': 800}
+            vp = await _vp(page)
             await _human_move(page, vp['width'] * _random.uniform(0.2, 0.8), vp['height'] * _random.uniform(0.3, 0.7))
             await _human_wheel(page, _random.randint(300, 900))
             await asyncio.sleep(_random.uniform(2, 7))
@@ -1684,14 +1961,12 @@ async def follow_user(user_id: str, xsec_token: str = "") -> str:
     if not await ensure_browser():
         return "请先登录小红书账号"
     token = xsec_token or _user_token_cache.get(user_id, '')
-    url = f"https://www.xiaohongshu.com/user/profile/{user_id}"
-    if token:
-        url += f"?xsec_token={token}&xsec_source=pc_note"
-    page = await browser_context.new_page()
-    page.set_default_timeout(30000)
+    page = None
+    opened_new = False
     try:
-        await page.goto(url, timeout=30000, referer="https://www.xiaohongshu.com/explore")
-        await asyncio.sleep(_random.uniform(3, 5))
+        # 像真人：在搜索结果里点作者（新标签页打开主页）；找不到链接才直接打开
+        page, opened_new = await _open_profile_human(main_page, user_id, token)
+        await _dwell(page, _random.uniform(3, 5))
         nick = await page.evaluate("() => (document.querySelector('.user-nickname, [class*=\"user-name\"]')||{}).innerText || ''")
         # 先看看对方的笔记，再回到顶部点关注
         for _ in range(_random.randint(1, 3)):
@@ -1720,7 +1995,12 @@ async def follow_user(user_id: str, xsec_token: str = "") -> str:
         return f"⚠️ 点了关注，但按钮还是「{after}」，请到浏览器确认"
     finally:
         await asyncio.sleep(_random.uniform(0.5, 1.5))
-        await page.close()
+        if opened_new and page is not None:
+            try:
+                await page.close()
+                await main_page.bring_to_front()
+            except Exception:
+                pass
 
 
 @mcp.tool()
@@ -1778,6 +2058,40 @@ async def login() -> str:
 
     return "登录等待超时，请重试。"
 
+async def _search_via_ui(page, keywords: str) -> bool:
+    """像真人一样搜索：停在（或先打开）小红书站内页，点搜索框、输入关键词、回车，等结果出来。
+    成功返回 True；任何一步失败返回 False，调用方退回直接打开搜索链接。"""
+    try:
+        cur = page.url or ""
+        if "xiaohongshu.com" not in cur or "/login" in cur or "website-login" in cur or "/404" in cur:
+            await page.goto("https://www.xiaohongshu.com/explore", timeout=60000)
+            await _rand_sleep(_random.uniform(2.5, 4.5))
+        box = None
+        for sel in ('#search-input', 'input.search-input', 'input[placeholder*="搜索"]'):
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                box = el
+                break
+        if not box:
+            return False
+        await _human_click(page, element=box)
+        await _rand_sleep(_random.uniform(0.4, 1.0))
+        await page.keyboard.press("Control+A")
+        await asyncio.sleep(_random.uniform(0.05, 0.15))
+        await page.keyboard.press("Backspace")
+        await _human_type(page, keywords)
+        await _rand_sleep(_random.uniform(0.5, 1.3))
+        await page.keyboard.press("Enter")
+        await page.wait_for_url(re.compile(r"search_result"), timeout=15000)
+        await page.wait_for_function(
+            "() => { const f = window.__INITIAL_STATE__?.search?.feeds; const v = f && (f.value !== undefined ? f.value : f._value); return !!(v && v.length); }",
+            timeout=20000)
+        return True
+    except Exception as e:
+        print(f"[search] 搜索框路径失败，改用直接链接：{str(e)[:100]}", file=sys.stderr, flush=True)
+        return False
+
+
 @mcp.tool()
 async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) -> str:
     """根据关键词搜索笔记。没有直链、只有关键词时使用。已有笔记链接时直接用 get_note_content，不要用搜索代替。
@@ -1803,7 +2117,8 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
     search_url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keywords)}&source=web_explore_feed"
 
     try:
-        await main_page.goto(search_url, timeout=60000)
+        if not await _search_via_ui(main_page, keywords):
+            await main_page.goto(search_url, timeout=60000)
 
         # 等待 __INITIAL_STATE__ 加载
         await main_page.wait_for_function(
@@ -1852,7 +2167,7 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
         no_new = 0
         while len(unique_items) < target_count and no_new < 3:
             prev = len(unique_items)
-            await main_page.evaluate("window.scrollBy(0, 800)")
+            await _wheel_by(main_page, 800)
             await _rand_sleep(1.5)
             await collect_feeds()
             if len(unique_items) == prev:
@@ -1916,7 +2231,7 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
         # 访问帖子链接，保留完整参数
         _cap, _cap_stop = _start_img_capture(main_page, ttl=180.0)
         await main_page.goto(processed_url, timeout=60000)
-        await asyncio.sleep(_random.uniform(12, 18))
+        await _dwell(main_page, _random.uniform(12, 18))
         
         # 检查是否加载了错误页面
         if not main_page:  # 添加空检查
@@ -1952,20 +2267,9 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
         if not main_page:  # 添加空检查
             return "浏览器初始化失败，请重试"
             
-        await main_page.evaluate('''
-            () => {
-                // 先滚动到页面底部
-                window.scrollTo(0, document.body.scrollHeight);
-                setTimeout(() => { 
-                    // 然后滚动到中间
-                    window.scrollTo(0, document.body.scrollHeight / 2); 
-                }, 1000);
-                setTimeout(() => { 
-                    // 最后回到顶部
-                    window.scrollTo(0, 0); 
-                }, 2000);
-            }
-        ''')
+        await _wheel_to_bottom(main_page, 6)   # 真滚轮往下看（内容/评论随之懒加载）
+        await _rand_sleep(_random.uniform(1, 2.5))
+        await _wheel_to_top(main_page, 8)
         await _rand_sleep(3)  # 等待滚动完成和内容加载
         
         # 打印页面结构片段用于分析
@@ -2458,15 +2762,15 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
                 img_urls = await main_page.evaluate("""() => {
                     const imgs = [];
                     // 笔记详情页的图片通常在 swiper 或 .note-slider 里
+                    // 只取轮播里的笔记图；不要 #detail-content / .note-content 下的 img（会混进"猜你想搜"的搜索图标、AI 角标等界面小图）
                     const selectors = [
                         '.swiper-slide img', '.note-slider img',
-                        '.media-container img', '#detail-content img',
-                        '.note-content img'
+                        '.media-container img'
                     ];
                     for (const sel of selectors) {
                         for (const img of document.querySelectorAll(sel)) {
                             const src = img.src || img.dataset.src || '';
-                            if (src && src.startsWith('http') && !imgs.includes(src))
+                            if (src && src.startsWith('http') && /\/\/sns-(webpic|img)[^/]*\.xhscdn\.com\//.test(src) && !imgs.includes(src))
                                 imgs.push(src);
                         }
                     }
@@ -2580,7 +2884,7 @@ async def get_note_comments(url: str) -> str:
         for locator in comment_section_locators:
             try:
                 if locator and await locator.count() > 0:  # 添加空检查
-                    await locator.scroll_into_view_if_needed(timeout=5000)
+                    await _wheel_into_view(locator)
                     await _rand_sleep(2)
                     break
             except Exception as e:
@@ -2593,7 +2897,7 @@ async def get_note_comments(url: str) -> str:
                 if not main_page:  # 添加空检查
                     break
                     
-                await main_page.evaluate("window.scrollBy(0, 500)")
+                await _wheel_by(main_page, 500)
                 await _rand_sleep(1)
                 
                 # 尝试点击"查看更多评论"按钮
@@ -2898,7 +3202,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
                     
                 element = await main_page.query_selector(selector)
                 if element:
-                    await element.scroll_into_view_if_needed()
+                    await _wheel_into_view(element)
                     await _rand_sleep(2)
                     comment_area_found = True
                     break
@@ -2911,7 +3215,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
             if not main_page:  # 添加空检查
                 return "浏览器初始化失败，请重试"
                 
-            await main_page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            await _wheel_to_bottom(main_page, 8)
             await _rand_sleep(2)
         
         # 定位评论输入框（简化选择器列表）
@@ -2931,7 +3235,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
                     
                 element = await main_page.query_selector(selector)
                 if element and await element.is_visible():
-                    await element.scroll_into_view_if_needed()
+                    await _wheel_into_view(element)
                     await _rand_sleep(1)
                     comment_input = element
                     break
@@ -2963,7 +3267,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
                 if not main_page:  # 添加空检查
                     return "浏览器初始化失败，请重试"
                     
-                await main_page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                await _wheel_to_bottom(main_page, 8)
                 await _rand_sleep(1)
                 
                 # 尝试再次查找输入框
@@ -3207,20 +3511,8 @@ async def get_notifications(tab: str = "comments", limit: int = 20, only_unrepli
     captured = {}
 
     try:
-        global notifications_page
-
-        # 复用已有通知标签页；若已关闭或崩溃则重新开一个
-        if notifications_page is not None:
-            try:
-                _ = notifications_page.url
-            except Exception:
-                notifications_page = None
-
-        if notifications_page is None:
-            notifications_page = await browser_context.new_page()
-            notifications_page.set_default_timeout(30000)
-
-        page = notifications_page
+        # 像真人：就在当前这个标签页里点侧栏"通知"进去（不再另开一个常驻通知标签页、也不直接 goto 通知链接）
+        page = main_page
 
         async def on_response(resp):
             if api_path in resp.url:
@@ -3232,28 +3524,27 @@ async def get_notifications(tab: str = "comments", limit: int = 20, only_unrepli
         page.on('response', on_response)
 
         try:
-            await page.goto("https://www.xiaohongshu.com/notification", timeout=30000)
-            await _rand_sleep(2)
-
-            # 点击对应 tab（如果不是默认的评论 tab）
-            if tab != "comments":
-                try:
-                    btn = page.locator(f'text="{tab_label}"').first
-                    if await btn.is_visible():
-                        await btn.click()
-                        await _rand_sleep(2)
-                except Exception:
-                    pass
-            else:
+            async with _notif_page_lock:
+                await _enter_notifications(page)   # 先停在站内普通页，再点侧栏通知入口（同一标签页）
                 await _rand_sleep(2)
 
-            # 模拟人在看通知，停留一会儿再处理数据
-            await _rand_sleep(3)
+                # 点击对应 tab（如果不是默认的评论 tab）
+                if tab != "comments":
+                    try:
+                        btn = page.locator(f'text="{tab_label}"').first
+                        if await btn.count() and await btn.is_visible():
+                            await _human_click(page, element=await btn.element_handle())
+                            await _rand_sleep(2)
+                    except Exception:
+                        pass
+                else:
+                    await _rand_sleep(2)
+
+                # 模拟人在看通知，停留一会儿再处理数据
+                await _dwell(page, _random.uniform(2.5, 4.5))
         finally:
             # 无论成功失败都移除监听器，避免泄漏
             page.remove_listener('response', on_response)
-
-        # 标签页保持打开，不关闭
 
         if not captured.get('data'):
             return f"暂无{tab_label}通知（或接口未响应）"
@@ -3380,6 +3671,87 @@ async def get_notifications(tab: str = "comments", limit: int = 20, only_unrepli
         return f"获取通知失败：{e}"
 
 
+_user_name_cache: dict = {}   # hex_id -> 昵称（search_user 搜到的），get_user_notes 找不到链接时用昵称重新搜
+
+
+async def _click_user_tab(page) -> bool:
+    """搜索结果页点"用户"标签：用拟人点击；找不到元素才退回 JS 点击。"""
+    try:
+        loc = page.locator('[class*="tab"], [class*="filter"] span, nav a, .search-tab, ul.tabs li, .channel').filter(
+            has_text=re.compile(r'^\s*用户\s*$')).first
+        if await loc.count() and await loc.is_visible():
+            await _human_click(page, element=await loc.element_handle())
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(await page.evaluate("""() => {
+            const tabs = Array.from(document.querySelectorAll('[class*="tab"], [class*="filter"] span, nav a, .search-tab, ul.tabs li'));
+            const t = tabs.find(el => el.innerText?.trim() === '用户' || el.textContent?.trim() === '用户');
+            if (t) { t.click(); return true; } return false; }"""))
+    except Exception:
+        return False
+
+
+async def _open_user_search(page, keyword: str):
+    """像真人一样搜用户：搜索框输入关键词回车（失败才直接打开搜索链接），再点"用户"标签。返回是否点到了标签。"""
+    if not await _search_via_ui(page, keyword):
+        await page.goto(f"https://www.xiaohongshu.com/search_result_ai?keyword={quote(keyword)}&source=web_explore_feed", timeout=30000)
+        try:
+            await page.wait_for_function("window.__INITIAL_STATE__ !== undefined", timeout=15000)
+        except Exception:
+            pass
+    await _rand_sleep(1.5)
+    clicked = await _click_user_tab(page)
+    if clicked:
+        await _rand_sleep(2)
+    return clicked
+
+
+async def _open_profile_human(page, hex_id: str, token: str):
+    """打开作者主页：像真人一样在搜索结果页点作者头像/昵称——小红书这里是在**新标签页**打开的。
+    返回 (主页所在页面, 是否新开了标签页)。找不到链接时先用缓存的昵称重新搜一次；还不行才直接 goto（旧做法）。"""
+    sel = f'a[href*="/user/profile/{hex_id}"]'
+
+    async def _find():
+        if '/search_result' not in (page.url or ''):
+            return None
+        for a in await page.query_selector_all(sel):
+            try:
+                if await a.is_visible() and not await a.evaluate("el => !!el.closest('header, nav, .nav, .sidebar, .side-bar')"):
+                    return a
+            except Exception:
+                continue
+        return None
+
+    link = await _find()
+    if link is None and _user_name_cache.get(hex_id):
+        try:
+            await _open_user_search(page, _user_name_cache[hex_id])
+            link = await _find()
+        except Exception as e:
+            print(f"[profile] 重新搜昵称失败: {str(e)[:80]}", file=sys.stderr, flush=True)
+    if link is not None:
+        try:
+            async with page.context.expect_page(timeout=8000) as pi:
+                await _human_click(page, element=link)
+            newp = await pi.value
+            newp.set_default_timeout(30000)
+            try:
+                await newp.wait_for_load_state("domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+            return newp, True
+        except Exception:
+            if f'/user/profile/{hex_id}' in (page.url or ''):  # 没开新标签、原页跳转了
+                return page, False
+    url = f"https://www.xiaohongshu.com/user/profile/{hex_id}"
+    if token:
+        url += f"?xsec_token={token}&xsec_source=pc_search"
+    await page.goto(url, timeout=30000)
+    return page, False
+
+
 @mcp.tool()
 async def search_user(keyword: str) -> str:
     """搜索小红书用户，返回匹配用户的昵称、hex ID 和 xsec_token。
@@ -3402,27 +3774,7 @@ async def search_user(keyword: str) -> str:
 
     is_number = keyword.isdigit()
     try:
-        search_url = f"https://www.xiaohongshu.com/search_result_ai?keyword={quote(keyword)}&source=web_explore_feed"
-        await main_page.goto(search_url, timeout=30000)
-        try:
-            await main_page.wait_for_function("window.__INITIAL_STATE__ !== undefined", timeout=15000)
-        except Exception:
-            pass
-        await _rand_sleep(1.5)
-
-        # 点击"用户"tab，等结果切换
-        clicked = await main_page.evaluate('''() => {
-            const tabs = Array.from(document.querySelectorAll(
-                '[class*="tab"], [class*="filter"] span, nav a, .search-tab, ul.tabs li'
-            ));
-            const userTab = tabs.find(el =>
-                el.innerText?.trim() === '用户' || el.textContent?.trim() === '用户'
-            );
-            if (userTab) { userTab.click(); return true; }
-            return false;
-        }''')
-        if clicked:
-            await _rand_sleep(2)  # 等用户结果渲染
+        await _open_user_search(main_page, keyword)
 
         # 只在用户搜索容器内找链接，优先找 __INITIAL_STATE__
         results = await main_page.evaluate('''() => {
@@ -3479,6 +3831,8 @@ async def search_user(keyword: str) -> str:
         for u in results:
             if u['hex_id'] and u['token']:
                 _user_token_cache[u['hex_id']] = u['token']
+            if u['hex_id'] and u.get('nickname'):
+                _user_name_cache[u['hex_id']] = u['nickname']
 
         # 数字小红书号是唯一的，直接取第一个
         if is_number:
@@ -3524,23 +3878,13 @@ async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) ->
 
     hex_id = user_id
     token = xsec_token
+    up = None
+    opened_new = False
 
     try:
         # 纯数字小红书号：自动搜索拿 hex ID 和 token
         if user_id.isdigit():
-            search_url = f"https://www.xiaohongshu.com/search_result_ai?keyword={quote(user_id)}&source=web_explore_feed"
-            await main_page.goto(search_url, timeout=30000)
-            try:
-                await main_page.wait_for_function("window.__INITIAL_STATE__ !== undefined", timeout=15000)
-            except Exception:
-                pass
-            await _rand_sleep(1.5)
-            await main_page.evaluate('''() => {
-                const tabs = Array.from(document.querySelectorAll('[class*="tab"], [class*="filter"] span, nav a, ul.tabs li'));
-                const t = tabs.find(el => el.innerText?.trim() === "用户" || el.textContent?.trim() === "用户");
-                if (t) t.click();
-            }''')
-            await _rand_sleep(2)
+            await _open_user_search(main_page, user_id)
             found = await main_page.evaluate('''() => {
                 const links = Array.from(document.querySelectorAll('a[href*="/user/profile/"]'));
                 for (const a of links) {
@@ -3562,21 +3906,21 @@ async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) ->
             # hex ID：从缓存取 token
             token = token or _user_token_cache.get(hex_id, "")
 
-        # 访问 profile 页，必须带 xsec_token 否则会被拦截
         profile_url = f"https://www.xiaohongshu.com/user/profile/{hex_id}"
         if token:
             profile_url += f"?xsec_token={token}&xsec_source=pc_search"
 
-        await main_page.goto(profile_url, timeout=30000)
-        await asyncio.sleep(4)
+        # 像真人那样在搜索结果里点作者（新标签页打开）；找不到才直接 goto
+        up, opened_new = await _open_profile_human(main_page, hex_id, token)
+        await _dwell(up, _random.uniform(3, 5))
 
         # 检查是否被拦截
-        title = await main_page.title()
+        title = await up.title()
         if "安全限制" in title or "未连接" in title:
             return f"访问被拦截（{title}），请检查 xsec_token 是否有效"
 
         # 提取用户信息和笔记——直接读 DOM（比穿透 Vue Proxy 更可靠）
-        data = await main_page.evaluate(f'''() => {{
+        data = await up.evaluate(f'''() => {{
             const result = {{ nickname: "", desc: "", fans: "", notes: [] }};
 
             // 用户昵称
@@ -3635,9 +3979,9 @@ async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) ->
 
         # 如果首屏没拿到，滚动一次再试
         if not data.get('notes'):
-            await main_page.evaluate("window.scrollBy(0, 600)")
+            await _wheel_by(up, 600)
             await _rand_sleep(2)
-            data = await main_page.evaluate(f'''() => {{
+            data = await up.evaluate(f'''() => {{
                 const notes = [];
                 const seen = new Set();
                 document.querySelectorAll('[class*="note-item"]').forEach(el => {{
@@ -3687,6 +4031,14 @@ async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) ->
 
     except Exception as e:
         return f"获取用户笔记失败：{str(e)}"
+    finally:
+        if opened_new and up is not None:  # 看完把新标签页关掉，回到搜索结果那个标签页（像真人 Ctrl+W）
+            try:
+                await asyncio.sleep(_random.uniform(0.6, 1.8))
+                await up.close()
+                await main_page.bring_to_front()
+            except Exception:
+                pass
 
 
 # ─── 首页 Feed / 我的笔记 ─────────────────────────────────────────────────────────
@@ -3850,11 +4202,7 @@ async def get_my_notes(limit: int = 50) -> str:
         no_new = 0
         while len(all_notes) < limit and no_new < 3:
             prev = len(all_notes)
-            await page.evaluate("""() => {
-                const container = document.querySelector('.note-list, .content-container, main');
-                if (container) container.scrollBy(0, 500);
-                else window.scrollBy(0, 500);
-            }""")
+            await _wheel_over_selector(page, '.note-list, .content-container, main', 500)
             await _rand_sleep(1.5)
             if len(all_notes) == prev:
                 no_new += 1
@@ -4024,10 +4372,9 @@ async def _reply_via_notification(comment_id: str, content: str):
     """在通知页直接回复（真人最常见的回复路径）。
     返回 (handled, msg)：handled=False 表示通知里没找到这条/没能打开回复框，什么都没发，调用方可走原路径。"""
     global notifications_page
-    if notifications_page is None or notifications_page.is_closed():
-        notifications_page = await browser_context.new_page()
-        notifications_page.set_default_timeout(30000)
-    page = notifications_page
+    if not main_page or main_page.is_closed():
+        return (False, "浏览器主标签页不可用")  # 主标签页不在，这轮不做
+    page = main_page
     cap = {}
 
     async def on_resp(r):
@@ -4066,7 +4413,7 @@ async def _reply_via_notification(comment_id: str, content: str):
         print(f"[notif_reply] DOM 与接口对不上：{expected} vs {actual}，改走笔记页", file=sys.stderr, flush=True)
         return False, ''
 
-    await item.scroll_into_view_if_needed()
+    await _wheel_into_view(item)
     await asyncio.sleep(_random.uniform(2, 5))  # 先读一下这条通知
     btn = await item.locator('.action-reply').element_handle(timeout=5000)
     await _human_click(page, btn)
@@ -4139,8 +4486,8 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
             try:
                 _handled, _msg = await _reply_via_notification(comment_id, content)
             finally:
-                if notifications_page is not None and not notifications_page.is_closed():
-                    await _watch_leave_notifications(notifications_page)  # 回复完回首页，页面不一直停在通知页
+                if main_page is not None and not main_page.is_closed():
+                    await _watch_leave_notifications(main_page)  # 回复完回首页，页面不一直停在通知页
     except _RiskBlocked:
         raise
     except Exception as e:
@@ -4171,13 +4518,13 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
                 comment_el = await page.query_selector(selector)
                 if comment_el:
                     break
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
+            await _wheel_by(page, (await page.evaluate("innerHeight")) * 0.8)
             await _rand_sleep(0.8)
 
         if not comment_el:
             return f"找不到评论 {comment_id}"
 
-        await comment_el.scroll_into_view_if_needed()
+        await _wheel_into_view(comment_el)
         await _rand_sleep(0.5)
 
         # 点回复按钮
@@ -4298,13 +4645,13 @@ async def like_comment(note_id: str, comment_id: str, xsec_token: str = "", unli
                 comment_el = await page.query_selector(selector)
                 if comment_el:
                     break
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 0.8)")
+            await _wheel_by(page, (await page.evaluate("innerHeight")) * 0.8)
             await _rand_sleep(0.8)
 
         if not comment_el:
             return f"找不到评论 {comment_id}"
 
-        await comment_el.scroll_into_view_if_needed()
+        await _wheel_into_view(comment_el)
         await _rand_sleep(0.5)
 
         like_btn = await comment_el.query_selector(".like .like-wrapper")
@@ -4471,29 +4818,19 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
     await _rand_sleep(1.0)
 
     # ── 点发布（xhs-publish-btn Web Component，closed shadow DOM）──
-    # 通过页面加载时注入的 attachShadow 拦截器访问 closed shadow root
-    # 按钮类名：button.ce-btn.bg-red（第二个 button，即"发布"）
-    # 先取 shadow 里"发布"按钮的屏幕坐标，用真实鼠标点；取不到再退回 JS click
-    _pos = await page.evaluate("""() => {
-        const xb = document.querySelector('xhs-publish-btn');
-        const sh = xb && (window.__shadowRoots?.get(xb) || xb.shadowRoot);
-        const btn = sh && (sh.querySelector('button.ce-btn.bg-red') || sh.querySelector('button.bg-red'));
-        if (!btn) return null;
-        const r = btn.getBoundingClientRect();
-        return (r.width > 0 && r.height > 0) ? [r.left + r.width / 2, r.top + r.height / 2] : null;
-    }""")
+    # 用调试协议穿透 closed shadow 取"发布"按钮的屏幕坐标（不往页面注入任何代码），再用真实鼠标点
+    # 按钮类名：button.ce-btn.bg-red（红色的"发布"）
+    _pos = await _pierce_center(page, 'xhs-publish-btn', ['button.ce-btn.bg-red', 'button.bg-red'])
     if _pos:
         await _human_click(page, x=_pos[0], y=_pos[1])
         clicked = "clicked: mouse"
     else:
+      # 退路：shadow 是 open 的时候直接用 shadowRoot 点（closed 时这里拿不到，会返回 no shadow root）
       clicked = await page.evaluate("""() => {
         const xhsBtn = document.querySelector('xhs-publish-btn');
         if (!xhsBtn) return null;
-
-        // 优先用注入的 __shadowRoots 访问 closed shadow root
-        const shadow = window.__shadowRoots?.get(xhsBtn) || xhsBtn.shadowRoot;
+        const shadow = xhsBtn.shadowRoot;
         if (shadow) {
-            // 精确找红色发布按钮
             const btn = shadow.querySelector('button.ce-btn.bg-red') ||
                         shadow.querySelector('button.bg-red') ||
                         shadow.querySelectorAll('button')[1];  // 第二个按钮是"发布"
@@ -4902,7 +5239,13 @@ async def _enter_chat(page):
 
     page.on('response', on_resp)
     try:
-        if 'xiaohongshu.com' not in page.url or '/chat' in page.url or '/notification' in page.url:
+        if re.search(r'/explore/[0-9a-f]{20,}', page.url or ''):  # 停在笔记弹窗上：先 Esc 关掉
+            try:
+                await page.keyboard.press('Escape')
+                await asyncio.sleep(_random.uniform(1.0, 2.0))
+            except Exception:
+                pass
+        if 'xiaohongshu.com' not in page.url or '/chat' in page.url or '/notification' in page.url or re.search(r'/explore/[0-9a-f]{20,}', page.url or ''):
             await page.goto("https://www.xiaohongshu.com/explore", timeout=30000)
             await asyncio.sleep(_random.uniform(3, 6))
         else:
@@ -4985,13 +5328,12 @@ async def get_chats(limit: int = 20) -> str:
     global notifications_page
     try:
         async with _notif_page_lock:
-            if notifications_page is None or notifications_page.is_closed():
-                notifications_page = await browser_context.new_page()
-                notifications_page.set_default_timeout(30000)
+            if not main_page or main_page.is_closed():
+                return "浏览器初始化失败，请重试"  # 主标签页不在
             try:
-                chats, _ = await _enter_chat(notifications_page)
+                chats, _ = await _enter_chat(main_page)
             finally:
-                await _watch_leave_notifications(notifications_page)
+                await _watch_leave_notifications(main_page)
     except _RiskBlocked:
         raise
     except Exception as e:
@@ -5026,10 +5368,9 @@ async def read_chat(user: str, limit: int = 20) -> str:
     global notifications_page
     try:
         async with _notif_page_lock:
-            if notifications_page is None or notifications_page.is_closed():
-                notifications_page = await browser_context.new_page()
-                notifications_page.set_default_timeout(30000)
-            page = notifications_page
+            if not main_page or main_page.is_closed():
+                return "浏览器初始化失败，请重试"  # 主标签页不在
+            page = main_page
             try:
                 chats, my_id = await _enter_chat(page)
                 chat, err = _dm_pick(chats, user)
@@ -5110,10 +5451,9 @@ async def send_chat(user: str, content: str, force: bool = False) -> str:
     global notifications_page
     try:
         async with _notif_page_lock:
-            if notifications_page is None or notifications_page.is_closed():
-                notifications_page = await browser_context.new_page()
-                notifications_page.set_default_timeout(30000)
-            page = notifications_page
+            if not main_page or main_page.is_closed():
+                return "浏览器初始化失败，请重试"  # 主标签页不在
+            page = main_page
             sent = False
             try:
                 chats, my_id = await _enter_chat(page)
