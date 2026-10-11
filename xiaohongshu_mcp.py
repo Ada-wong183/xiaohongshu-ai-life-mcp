@@ -35,10 +35,14 @@ from patchright.async_api import async_playwright  # patchright：Playwright 的
 import patchright.async_api as _pr_api
 
 
+_MAIN_WORLD_MARKERS = ("__INITIAL_STATE__",)   # 只有读页面自己的全局变量时才需要主世界
+
+
 def _patch_main_world_eval():
-    """patchright 的 evaluate 默认跑在隔离世界，读不到页面自己的全局变量（如 window.__INITIAL_STATE__、
-    页面状态之类）。本项目大量依赖这些，所以把所有 evaluate 类方法
-    的 isolated_context 默认值改成 False（主世界，行为和原版 Playwright 一致）。调用方显式传值时尊重调用方。"""
+    """patchright 的 evaluate 默认跑在隔离世界：页面看不到我们的脚本（页面就算包装了 querySelectorAll 之类的原生函数
+    也读不到我们的调用栈）。主世界里的 evaluate 会留下 "eval at evaluate (:337:30) / UtilityScript.evaluate" 这种特征帧
+    （2026-10-11 本机验证过）。所以：默认用隔离世界；只有脚本里要读页面自己的全局变量（window.__INITIAL_STATE__）时才切主世界。
+    调用方显式传 isolated_context 时尊重调用方。DOM 是共享的，只读 DOM 的脚本在隔离世界里照常工作。"""
     import functools
     for _cls in (_pr_api.Page, _pr_api.Frame, _pr_api.Locator, _pr_api.ElementHandle, _pr_api.JSHandle):
         for _name in ("evaluate", "evaluate_handle", "evaluate_all"):
@@ -48,7 +52,9 @@ def _patch_main_world_eval():
             def _mk(orig):
                 @functools.wraps(orig)
                 async def _w(self, *a, **kw):
-                    kw.setdefault("isolated_context", False)
+                    if "isolated_context" not in kw:
+                        src = a[0] if a and isinstance(a[0], str) else ""
+                        kw["isolated_context"] = not any(m in src for m in _MAIN_WORLD_MARKERS)
                     return await orig(self, *a, **kw)
                 return _w
             setattr(_cls, _name, _mk(_orig))
@@ -488,6 +494,8 @@ async def _human_move(page, x: float, y: float):
         ux, uy = (bx - ax) / d, (by - ay) / d
         px, py = -uy, ux  # 垂直方向
         bend = min(90.0, d * 0.18)
+        if _random.random() < 0.3:      # 真人直线度分布有长尾（p10≈0.56）：约三成的移动弯得明显
+            bend = min(160.0, d * 0.4)
         o1, o2 = _random.uniform(-bend, bend), _random.uniform(-bend, bend)
         t1, t2 = _random.uniform(0.2, 0.4), _random.uniform(0.6, 0.85)
         c1 = (ax + (bx - ax) * t1 + px * o1, ay + (by - ay) * t1 + py * o1)
@@ -495,12 +503,12 @@ async def _human_move(page, x: float, y: float):
         n = max(8, min(110, int(dur / 0.013)))
         for i in range(1, n + 1):
             t = i / n
-            s = t * t * t * (10 - 15 * t + 6 * t * t)  # 最小加加速度
+            s = 1 - (1 - t) ** 4 * (1 + 4 * t)  # Beta(2,4) 累积：约 25% 处速度最大(≈均速的2.1倍)，之后拖一条减速长尾——真人实测峰值≈均速的2.8倍
             m = 1 - s
             bxs = m**3 * ax + 3 * m * m * s * c1[0] + 3 * m * s * s * c2[0] + s**3 * bx
             bys = m**3 * ay + 3 * m * m * s * c1[1] + 3 * m * s * s * c2[1] + s**3 * by
             if i < n:
-                shake = 1.2 * (1 - t)
+                shake = 0.7 + 1.2 * (1 - t)   # 手的微颤：到点附近也有约 ±0.7px 的小抖动，不会"完全平滑地停下"
                 bxs += _random.uniform(-shake, shake)
                 bys += _random.uniform(-shake, shake)
             else:
@@ -508,7 +516,7 @@ async def _human_move(page, x: float, y: float):
             await page.mouse.move(bxs, bys)
             await asyncio.sleep(max(0.004, dur / n * _random.uniform(0.7, 1.3)))
 
-    dur = min(1.0, 0.08 + 0.05 * math.log2(dist / 30 + 1)) * _random.uniform(0.75, 1.25)
+    dur = min(1.4, max(0.12, -0.08 + 0.17 * math.log2(dist / 30 + 1))) * _random.uniform(0.8, 1.25)  # 与真人 493 段实测的 距离→时长 对齐：70px≈0.22s，230px≈0.41s，600px≈0.7s
     if dist > 250 and _random.random() < 0.3:
         over = _random.uniform(8, 24)
         ox = x + (x - x0) / dist * over + _random.uniform(-4, 4)
@@ -700,6 +708,7 @@ async def _human_click(page, element=None, x: float = None, y: float = None):
                 pass
             box = await element.bounding_box()
             if box is None:
+                print("[click] 元素没有可见区域，退回 Playwright 点击（瞬移，无鼠标轨迹）", file=sys.stderr, flush=True)
                 await element.click()
                 return
             cx = box['x'] + box['width'] * _random.uniform(0.3, 0.7)
@@ -709,12 +718,13 @@ async def _human_click(page, element=None, x: float = None, y: float = None):
         else:
             return
         await _human_move(page, cx, cy)
-        await asyncio.sleep(_random.uniform(0.02, 0.10))  # 到位后停一下再按（真人实测中位约60ms）
+        await asyncio.sleep(min(2.5, _random.lognormvariate(-1.39, 0.9)))  # 到位后停一下再按：真人 117 次点击实测 中位0.27s、p10 0.05s、p90 约3s
         await page.mouse.down()
         await asyncio.sleep(_random.uniform(0.04, 0.13))   # 按住一小会儿
         await page.mouse.up()
-    except Exception:
+    except Exception as _e:
         if element is not None:
+            print(f"[click] 拟人点击出错，退回 Playwright 点击：{str(_e)[:80]}", file=sys.stderr, flush=True)
             try:
                 await element.click()
             except Exception:
@@ -957,12 +967,7 @@ async def _type_with_at_mention(page, text: str, avatar_map: dict | None = None)
             search_term = m.group(1)
             await _key_char(page, '@')
             await asyncio.sleep(1.5)
-            for ch in search_term:
-                if _CJK_RE.match(ch):
-                    await page.keyboard.type(ch)
-                else:
-                    await _key_char(page, ch)
-                await asyncio.sleep(0.25)
+            await _human_type(page, search_term)  # 中文走拼音输入法事件序列，英文逐键（原来中文用 keyboard.type 绕过输入法）
             # 等待 picker 出现（最多 3 秒），然后一次性在 JS 里找到目标项坐标
             await asyncio.sleep(0.3)
             # 优先用 avatar_map 里预加载的 CDN key；没有则留空
@@ -2915,7 +2920,7 @@ async def get_note_comments(url: str) -> str:
                             
                         more_btn = main_page.locator(selector).first
                         if more_btn and await more_btn.count() > 0 and await more_btn.is_visible():  # 添加空检查
-                            await more_btn.click()
+                            await _human_click(main_page, element=await more_btn.element_handle())  # 拟人轨迹点击（原来是 Playwright 瞬移）
                             await _rand_sleep(2)
                     except Exception as e:
                         print(f"点击查看更多按钮时出错: {str(e)}")
@@ -3326,28 +3331,10 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
             except Exception as e:
                 print(f"使用Enter键发送出错: {str(e)}")
         
-        # 方法3: 如果方法2失败，尝试使用JavaScript点击发送按钮
+        # 方法3（JS 直接点发送）已移除：JS 点击是 isTrusted=false，主路径失败时宁可明确报失败，也不静默降级成脚本行为
         if not send_success:
-            try:
-                if not main_page:  # 添加空检查
-                    return "浏览器初始化失败，请重试"
-                    
-                js_send_result = await main_page.evaluate('''
-                    () => {
-                        const sendButtons = Array.from(document.querySelectorAll('button'))
-                            .filter(btn => btn.textContent && btn.textContent.includes('发送'));
-                        if (sendButtons.length > 0) {
-                            sendButtons[0].click();
-                            return true;
-                        }
-                        return false;
-                    }
-                ''')
-                await _rand_sleep(2)
-                send_success = js_send_result
-            except Exception as e:
-                print(f"使用JavaScript点击发送按钮出错: {str(e)}")
-        
+            print("[comment] 发送按钮没点到、回车也没发出去：评论没有发送（不再用 JS 点击兜底）", file=sys.stderr, flush=True)
+
         if send_success:
             _warn = ''
             _risk = await _detect_risk(main_page)
@@ -3684,13 +3671,8 @@ async def _click_user_tab(page) -> bool:
             return True
     except Exception:
         pass
-    try:
-        return bool(await page.evaluate("""() => {
-            const tabs = Array.from(document.querySelectorAll('[class*="tab"], [class*="filter"] span, nav a, .search-tab, ul.tabs li'));
-            const t = tabs.find(el => el.innerText?.trim() === '用户' || el.textContent?.trim() === '用户');
-            if (t) { t.click(); return true; } return false; }"""))
-    except Exception:
-        return False
+    print("[search] 没找到可点的\"用户\"标签（不再用 JS 点击兜底）", file=sys.stderr, flush=True)
+    return False
 
 
 async def _open_user_search(page, keyword: str):
@@ -4534,17 +4516,15 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
         await _human_click(page, reply_btn)
         await _rand_sleep(0.8)
 
-        # 输入内容（直接 evaluate 设置 + 触发 input 事件，绕过 Vue 响应式）
+        # 输入内容：点输入框 + 拟人输入（拼音输入法事件序列；原来是 evaluate 直接写 textContent + 合成 input 事件）
         comment_input = await page.query_selector(
             "div.input-box div.content-edit p.content-input"
         )
         if not comment_input:
             return "找不到回复输入框"
-
-        await comment_input.evaluate("""(el, text) => {
-            el.textContent = text;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-        }""", content)
+        await _human_click(page, element=comment_input)
+        await _rand_sleep(0.5)
+        await _human_type(page, content, soft_newline=True)
         await _rand_sleep(0.5)
 
         # 提交
@@ -4667,9 +4647,7 @@ async def like_comment(note_id: str, comment_id: str, xsec_token: str = "", unli
         if (unlike and not is_liked) or (not unlike and is_liked):
             return f"无需操作：评论当前{'已点赞' if is_liked else '未点赞'}"
 
-        await like_btn.evaluate("""el => {
-            el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-        }""")
+        await _human_click(page, element=like_btn)  # 真实鼠标轨迹+真点击（原来是 JS 派发的 isTrusted=false 事件）
         await _rand_sleep(0.8)
         _RateLimit.record('like')
         return f"✅ {action}成功"
@@ -4758,6 +4736,22 @@ async def _pub_click(page, selector: str, text: str = "", timeout: float = 10.0)
     return False
 
 
+async def _upload_files_human(page, paths) -> bool:
+    """像真人那样上传：点"上传图片"按钮（页面会看到真实的按钮点击→文件选择→change），而不是直接往隐藏的 input 里塞文件。
+    文件选择框由调试协议接管（不会真的弹系统对话框）。失败返回 False，调用方退回 set_input_files。"""
+    try:
+        async with page.expect_file_chooser(timeout=8000) as fc:
+            ok = await _pub_click(page, 'button', '上传图片', timeout=6)
+            if not ok:
+                raise RuntimeError("没找到上传图片按钮")
+        chooser = await fc.value
+        await chooser.set_files(paths)
+        return True
+    except Exception as e:
+        print(f"[publish] 点上传按钮失败，退回直接设置文件: {str(e)[:80]}", file=sys.stderr, flush=True)
+        return False
+
+
 async def _fill_and_publish(page, title: str, content: str, tags: list,
                             text_card_mode: bool = False) -> str:
     """填写标题、正文、标签，然后点发布。供两种模式复用。"""
@@ -4770,7 +4764,7 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
         await page.query_selector("input.d-text")
     )
     if title_el:
-        await title_el.click()
+        await _human_click(page, element=title_el)
         await _rand_sleep(0.3)
         await _human_type(page, title[:20])
     await _rand_sleep(0.4)
@@ -4781,7 +4775,7 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
         # 发布编辑页的 tiptap 可能残留卡片文字，先全选清空再写正文
         editor = await page.query_selector("div.tiptap.ProseMirror")
         if editor:
-            await editor.click()
+            await _human_click(page, element=editor)
             await page.keyboard.press("Control+a")
             await _rand_sleep(0.2)
             await page.keyboard.press("Delete")
@@ -4793,14 +4787,14 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
         editor = (await page.query_selector("div.tiptap.ProseMirror") or
                   await page.query_selector("div.ql-editor"))
         if editor and content:
-            await editor.click()
+            await _human_click(page, element=editor)
             await _rand_sleep(0.3)
             await _human_type(page, content)
     await _rand_sleep(0.5)
 
     # ── 添加话题标签 ─────────────────────────────────────────
     if tags and editor:
-        await editor.click()
+        await _human_click(page, element=editor)
         await page.keyboard.press("Control+End")
         await _rand_sleep(0.3)
         for tag in tags:
@@ -4810,7 +4804,7 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
                 f'#creator-editor-topic-container .item:has-text("{tag}")'
             )
             if sug:
-                await sug.click()
+                await _human_click(page, element=sug)
             else:
                 await page.keyboard.press("Space")
             await _rand_sleep(0.4)
@@ -4825,28 +4819,8 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
         await _human_click(page, x=_pos[0], y=_pos[1])
         clicked = "clicked: mouse"
     else:
-      # 退路：shadow 是 open 的时候直接用 shadowRoot 点（closed 时这里拿不到，会返回 no shadow root）
-      clicked = await page.evaluate("""() => {
-        const xhsBtn = document.querySelector('xhs-publish-btn');
-        if (!xhsBtn) return null;
-        const shadow = xhsBtn.shadowRoot;
-        if (shadow) {
-            const btn = shadow.querySelector('button.ce-btn.bg-red') ||
-                        shadow.querySelector('button.bg-red') ||
-                        shadow.querySelectorAll('button')[1];  // 第二个按钮是"发布"
-            if (btn) {
-                btn.click();
-                return 'clicked: ' + (btn.className || btn.textContent?.trim());
-            }
-            return 'shadow found but no btn, HTML: ' + shadow.innerHTML.substring(0, 200);
-        }
-        return 'no shadow root';
-    }""")
-
-    if not clicked:
-        return "找不到 xhs-publish-btn 元素"
-    if 'no shadow' in clicked or 'shadow found but' in clicked:
-        return f"发布按钮定位失败：{clicked}"
+        print("[publish] 穿透 closed shadow 没找到发布按钮（不再用 JS 点击兜底）", file=sys.stderr, flush=True)
+        return "找不到发布按钮（xhs-publish-btn 穿透失败），没有点发布"
 
     # 轮询最多 20 秒：跳到成功页/管理页，或页面出现"发布成功"，才算成功
     for _ in range(20):
@@ -5016,7 +4990,7 @@ async def publish_note(
             # 输入卡片文字（只放标题，正文另外写）
             text = card_text or title
             editor = await page.query_selector("div.tiptap.ProseMirror")
-            await editor.click()
+            await _human_click(page, element=editor)
             await _rand_sleep(0.3)
             await _human_type(page, text)
             await _rand_sleep(0.8)
@@ -5071,11 +5045,11 @@ async def publish_note(
             if not valid_paths:
                 return "upload 模式需要提供有效的 image_paths"
 
-            upload_input = await page.query_selector(".upload-input")
-            if not upload_input:
-                return "找不到上传输入框（.upload-input）"
-
-            await upload_input.set_input_files(valid_paths)
+            if not await _upload_files_human(page, valid_paths):
+                upload_input = await page.query_selector(".upload-input")
+                if not upload_input:
+                    return "找不到上传输入框（.upload-input）"
+                await upload_input.set_input_files(valid_paths)
 
             # 等待上传完成（最多60秒）
             t0 = asyncio.get_event_loop().time()
@@ -5096,10 +5070,11 @@ async def publish_note(
             except Exception as e:
                 return f"Pillow 生成图片失败：{e}"
 
-            upload_input = await page.query_selector(".upload-input")
-            if not upload_input:
-                return "找不到上传输入框"
-            await upload_input.set_input_files([temp_img])
+            if not await _upload_files_human(page, [temp_img]):
+                upload_input = await page.query_selector(".upload-input")
+                if not upload_input:
+                    return "找不到上传输入框"
+                await upload_input.set_input_files([temp_img])
 
             t0 = asyncio.get_event_loop().time()
             while asyncio.get_event_loop().time() - t0 < 30:
@@ -5291,24 +5266,19 @@ def _dm_pick(chats: list, user: str):
 
 
 async def _dm_open_conversation(page, name: str) -> bool:
-    """在左侧会话列表里点中指定昵称的那一项（真鼠标）。"""
-    pos = await page.evaluate("""(name) => {
-        const items = [...document.querySelectorAll('.xhs-im-conv-item')];
-        const it = items.find(e => (e.querySelector('.xhs-im-conv-item__name')?.innerText || '').trim() === name);
-        if (!it) return null;
-        it.scrollIntoView({block: 'center'});
-        const r = it.getBoundingClientRect();
-        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-    }""", name)
-    if not pos:
+    """在左侧会话列表里点中指定昵称的那一项（真鼠标；滚动也走真滚轮，不再用 JS scrollIntoView）。"""
+    target = None
+    for it in await page.query_selector_all('.xhs-im-conv-item'):
+        try:
+            nm = await it.evaluate("e => (e.querySelector('.xhs-im-conv-item__name')?.innerText || '').trim()")
+        except Exception:
+            continue
+        if nm == name:
+            target = it
+            break
+    if target is None:
         return False
-    await asyncio.sleep(0.5)
-    pos = await page.evaluate("""(name) => {
-        const it = [...document.querySelectorAll('.xhs-im-conv-item')].find(e => (e.querySelector('.xhs-im-conv-item__name')?.innerText || '').trim() === name);
-        const r = it.getBoundingClientRect();
-        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
-    }""", name)
-    await _human_click(page, x=pos['x'], y=pos['y'])
+    await _human_click(page, element=target)  # 内含 _wheel_into_view（真滚轮）+ 拟人鼠标轨迹
     return True
 
 
