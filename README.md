@@ -109,6 +109,9 @@ Claude Code 的 `~/.claude.json` 里加入：
 | `XHS_WAKE_LOG` | 唤醒日志路径，默认 `~/xhs-wake-events.log` |
 | `XHS_WATCH_HOURS` | 普通通知的叫醒时段，默认 `8-23` |
 | `XHS_IDLE` | `0` 关闭闲逛养号 |
+| `XHS_AUTOCLOSE_MIN` | 看门狗和闲逛都关着时，MCP 空闲多少分钟后自动关闭 Chrome（下次调用自动重启），默认 `60`，`0` 不自动关；若 Chrome 里开着非小红书标签页则不关 |
+| `XHS_CHROME_PROFILE` | Chrome 用户数据目录，默认 `~/chrome-real`（见下方说明） |
+| `XHS_CALL_LOG` | 工具调用日志路径，默认 `~/xhs-calls.log`（每次调用一行：时间 / 工具 / 状态 / 耗时 / 参数 / 结果摘要，1MB×3 轮转） |
 
 ---
 
@@ -123,30 +126,32 @@ Claude Code 的 `~/.claude.json` 里加入：
 
 ### 内容获取
 
+> **参数命名约定**：笔记统一叫 `note`（完整链接或 24 位 id 都行；只给 id 时 `xsec_token` 自动从缓存补）；用户叫 `user`；文字内容叫 `content`；搜索叫 `keywords`。旧参数名（`url` / `note_id` / `user_id` / `keyword` / `comment` / `chat_user_id`）由中间件在校验前自动换成新名，仍可使用。
+
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `search_notes` | `keywords`, `limit=20`, `verbose=False` | 关键词搜索笔记 |
 | `list_feeds` | `limit=20`, `verbose=False` | 首页推荐信息流 |
-| `get_note_content` | `url`, `include_images=True`, `include_comments=True` | 笔记正文 + 前 15 条评论（`include_comments=False` 只取正文）；≤4 张图返回本地路径，>4 张用 Gemini 分析。链接缺 `xsec_token` 时自动用缓存补 |
-| `get_note_comments` | `url` | 完整评论列表（含楼中楼展开） |
-| `get_note_images` | `url` | 只取图片，不含正文 |
+| `get_note_content` | `note`, `include_images=True`, `include_comments=True` | 笔记正文 + 前 15 条评论（`include_comments=False` 只取正文）；≤4 张图返回本地路径，>4 张用 Gemini 分析。链接缺 `xsec_token` 时自动用缓存补 |
+| `get_note_comments` | `note`, `limit=0` | 评论列表（含楼中楼展开）；`limit` 只截断输出的一级评论条数；头部会写"页面共 N 条，读到 M 条"，漏读一目了然 |
+| `get_note_images` | `note` | 只取图片，不含正文 |
 | `get_notifications` | `tab="comments"`, `limit=20`, `only_unreplied=False`, `verbose=False` | 评论@ / 赞和收藏 / 新增关注；自动对照回复记录标"已回复" |
-| `search_user` | `keyword` | 按小红书号或昵称找用户 |
-| `get_user_notes` | `user_id`, `xsec_token=""`, `limit=20` | 某个用户的笔记列表 |
+| `search_user` | `keywords` | 按小红书号或昵称找用户 |
+| `get_user_notes` | `user`, `xsec_token=""`, `limit=20` | 某个用户的笔记列表；`user` 可填小红书号或 hex id，填 `me` 看自己的主页 |
 | `get_my_notes` | `limit=50` | 自己的笔记列表，同时缓存每条笔记的 `xsec_token` |
 
 ### 互动
 
 | 工具 | 参数 | 说明 |
 |------|------|------|
-| `post_comment` | `url`, `comment`, `force=False` | 发评论（先读后评，逐字打字） |
-| `reply_comment` | `note_id`, `comment_id`, `content`, `xsec_token=""`, `force=False` | 回复评论；已回复过默认拦截，`force=True` 才再发 |
-| `like_note` | `note_id`, `xsec_token=""`, `unlike=False` | 点赞 / 取消 |
-| `like_comment` | `note_id`, `comment_id`, `xsec_token=""`, `unlike=False` | 给评论点赞 |
-| `favorite_note` | `note_id`, `xsec_token=""`, `unfavorite=False` | 收藏 / 取消 |
-| `follow_user` | `user_id`, `xsec_token=""` | 先在对方主页逛一会儿再关注，已关注不重复点 |
-| `add_comment_history` | `note_id`, `content`, `action_type`, `comment_id` | 漏记时手动补录评论/回复历史 |
-| `get_comment_history` | `note_id=""`, `limit=20` | 查评论/回复历史（用来去重） |
+| `post_comment` | `note`, `content`, `force=False` | 发评论（先读后评，逐字打字） |
+| `reply_comment` | `note`, `comment_id`, `content`, `xsec_token=""`, `force=False` | 回复评论；已回复过默认拦截，`force=True` 才再发 |
+| `like_note` | `note`, `xsec_token=""`, `unlike=False` | 点赞 / 取消 |
+| `like_comment` | `note`, `comment_id`, `xsec_token=""`, `unlike=False` | 给评论点赞 |
+| `favorite_note` | `note`, `xsec_token=""`, `unfavorite=False` | 收藏 / 取消 |
+| `follow_user` | `user`, `xsec_token=""` | 先在对方主页逛一会儿再关注，已关注不重复点 |
+| `add_comment_history` | `note`, `content`, `action_type`, `comment_id` | 漏记时手动补录评论/回复历史 |
+| `get_comment_history` | `note=""`, `limit=20` | 查评论/回复历史（用来去重） |
 
 ### 私信
 
@@ -164,7 +169,7 @@ Claude Code 的 `~/.claude.json` 里加入：
 | 工具 | 参数 | 说明 |
 |------|------|------|
 | `publish_note` | 见下 | 发布图文笔记 |
-| `delete_note` | `note_id` | 删除自己的笔记（`note_id` 来自 `get_my_notes` 链接末段） |
+| `delete_note` | `note` | 删除自己的笔记（`note` 填 `get_my_notes` 返回的链接或其中的笔记 id） |
 
 **`publish_note` 参数**
 
@@ -210,12 +215,14 @@ tail -n 0 -F ~/xhs-wake-events.log
 | 随机等待 | 所有等待都带随机抖动，没有固定节奏 |
 | 拟人输入 | 中文按 1~4 字一组上屏，模拟输入法选词，偶尔停顿；长文按段落上屏 |
 | 拟人点击 | 鼠标先到附近再缓慢移到目标；创作者页的隐藏/叠放重复节点只点视口内可见的那份 |
-| 持久化限速 | 评论/回复限最短间隔，点赞、搜索、关注另有小时上限；记录在 `xhs_actions.db`，重启不清零 |
+| 持久化限速 | 评论/回复限最短间隔，点赞、搜索、关注另有小时上限；读类工具（看笔记/评论/主页/通知/私信/首页）合计限每 15 秒 1 次、每小时 20 次、每天 100 次；记录在 `xhs_actions.db`，重启不清零 |
 | 风控熔断 | 检测验证码页、安全限制、"操作频繁"；命中暂停所有操作 6 小时（24 小时内再次触发则 24 小时），`risk_status` 可查看/解除 |
 | 先看再评 | 发评论前先在笔记里随机滚动停留 |
 | 站内进入 | 进通知页是点侧栏入口（带来源页的站内跳转），不是每次直接输网址 |
 | 闲逛养号 | 9:00~23:00 间每隔 1.5~5 小时随机刷首页、点开 1~3 篇，不点赞不评论；有工具调用立刻让路。`XHS_IDLE=0` 关闭 |
-| closed Shadow DOM | 拦截 `attachShadow`，访问发布按钮这类 Web Component 内部 |
+| closed Shadow DOM | 不往页面注入任何脚本；发布按钮这类 closed shadow 里的元素，通过调试协议的 DOM 域读取坐标，再用真鼠标点击 |
+| 调用日志 | 每次工具调用在 `~/xhs-calls.log` 里留一行，排查超时/空结果/未登录一眼能看出 |
+| 空闲自动关 Chrome | 长时间不用就关掉 Chrome 省内存（见 `XHS_AUTOCLOSE_MIN`） |
 
 ## ❓ 常见问题
 
@@ -241,6 +248,15 @@ Xvfb :99 -screen 0 1280x1024x24 &
 export DISPLAY=:99
 ```
 
+## 🧭 Chrome 用户数据目录（重要）
+
+Chrome 较新版本要求：开启远程调试端口（CDP）时必须使用**非默认**的 `--user-data-dir`，否则调试端口会被静默拒绝。所以不能直接指向 `~/.config/google-chrome`。做法：把默认 profile **复制**一份到别的目录（默认 `~/chrome-real`，可用 `XHS_CHROME_PROFILE` 改），日常上网和 MCP 都用这一份：
+
+- MCP 自己拉起 Chrome 时会带 `--remote-debugging-port=9222 --user-data-dir=<该目录>`；
+- 日常也用 `chrome-real.sh` 这类脚本启动同一份 profile，这样登录态天然共享；
+- 同一份 profile 同一时间只能有一个 Chrome 进程占用；
+- Linux 上 Chrome 用系统密钥环加密 cookie：用 systemd 服务启动时，务必让 Chrome 继承桌面会话的 `DBUS_SESSION_BUS_ADDRESS`、`XDG_CURRENT_DESKTOP`、`DISPLAY`，否则读不出桌面写的 cookie，登录态会被清空。**不要重置密钥环。**
+
 ## 📁 文件结构
 
 ```
@@ -248,7 +264,7 @@ xiaohongshu-ai-life-mcp/
 ├── xiaohongshu_mcp.py   主程序，全部 MCP 工具与看门狗
 ├── requirements.txt     Python 依赖
 ├── .env.example         配置示例（复制为 .env，不会进 git）
-├── browser_data/        Chrome 用户数据与登录态（自动生成，不要上传）
+├── chrome-real.sh       日常 Chrome 启动脚本（带调试端口，和 MCP 共用同一份 profile）
 └── xhs_actions.db       限速、评论历史、已见通知、token 缓存（自动生成，不要上传）
 ```
 

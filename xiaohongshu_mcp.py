@@ -246,7 +246,9 @@ class _RateLimit:
         'comment':     {'min_interval': 120, 'max_per_hour': None},
         'reply':       {'min_interval': 120, 'max_per_hour': None},
         'like':        {'min_interval': 30,  'max_per_hour': 20},
-        'search':      {'min_interval': 10,  'max_per_hour': 30},
+        'search':      {'min_interval': 10,  'max_per_hour': 30, 'max_per_day': 60},
+        # 读类工具（看笔记/评论/主页/通知/私信/首页）统一计数：平台把"浏览行为异常"也算违规
+        'read':        {'min_interval': 15,  'max_per_hour': 20, 'max_per_day': 100},
         'image_fetch': {'min_interval': 8,   'max_per_hour': 60},
         'follow':      {'min_interval': 60,  'max_per_hour': 10},
     }
@@ -304,9 +306,10 @@ class _RateLimit:
         try:
             with _rl_db() as conn:
                 conn.execute("DELETE FROM rate_events WHERE ts < ?", (now - 7 * 86400,))
-                history = [r[0] for r in conn.execute(
+                day_history = [r[0] for r in conn.execute(
                     "SELECT ts FROM rate_events WHERE action_type=? AND ts > ? ORDER BY ts",
-                    (action_type, now - 3600))]
+                    (action_type, now - 86400))]
+                history = [t for t in day_history if t > now - 3600]
         except Exception as e:
             print(f"[ratelimit] 读记录失败: {e}", file=sys.stderr, flush=True)
             return None
@@ -316,6 +319,9 @@ class _RateLimit:
         if cfg['max_per_hour'] and len(history) >= cfg['max_per_hour']:
             wait = int(3600 - (now - history[0]))
             return f"⏳ 本小时 {action_type} 次数已达上限（{cfg['max_per_hour']} 次），请等待约 {wait} 秒后再试。"
+        if cfg.get('max_per_day') and len(day_history) >= cfg['max_per_day']:
+            wait = int(86400 - (now - day_history[0]))
+            return f"⏳ 今日 {action_type} 次数已达上限（{cfg['max_per_day']} 次/24h），请约 {wait//60} 分钟后再试。（防风控：控制总用量）"
         return None
 
     @classmethod
@@ -325,6 +331,15 @@ class _RateLimit:
                 conn.execute("INSERT INTO rate_events (action_type, ts) VALUES (?, ?)", (action_type, _time.time()))
         except Exception as e:
             print(f"[ratelimit] 写记录失败: {e}", file=sys.stderr, flush=True)
+
+
+def _read_gate():
+    """读类工具入口限速。返回 None 表示放行（并记一次），否则返回拒绝文案。"""
+    r = _RateLimit.check('read')
+    if r:
+        return r
+    _RateLimit.record('read')
+    return None
 
 
 def _url_is_risky(url: str) -> bool:
@@ -360,6 +375,22 @@ async def _detect_risk(page):
         return None
 
 
+async def _dismiss_login_modal(page):
+    """浏览不需要登录：遇到登录弹窗（含"登录超限"）直接关掉。先点右上角×，不行就从 DOM 里摘掉（别按 Esc：笔记详情页按 Esc 会跳回首页）。"""
+    try:
+        if not await page.evaluate("() => !!document.querySelector('.login-modal')"):
+            return False
+        try:
+            await page.locator('.login-modal .close-button').first.click(timeout=2000)
+            await asyncio.sleep(0.6)
+        except Exception:
+            pass
+        await page.evaluate("() => document.querySelectorAll('.login-modal').forEach(e => e.remove())")
+        return True
+    except Exception:
+        return False
+
+
 def _arm_page(page):
     """给 page 装上风控守卫：goto 前查熔断，goto 后查风控；任何主框架跳到验证页也会触发熔断。幂等。"""
     if page is None or getattr(page, '_risk_armed', False):
@@ -370,11 +401,17 @@ def _arm_page(page):
         b = _RateLimit.breaker_message()
         if b:
             raise _RiskBlocked(b)
+        # 小红书页面资源重，等 load 极易超时；domcontentloaded 够用（__INITIAL_STATE__ 此时已有）
+        kwargs.setdefault("wait_until", "domcontentloaded")
         resp = await _orig_goto(url, *args, **kwargs)
         reason = await _detect_risk(page)
         if reason:
             _RateLimit.trip(reason)
             raise _RiskBlocked(f"🛑 检测到风控（{reason}），已熔断并暂停所有小红书操作。")
+        # 浏览免登录：页面加载后若冒出登录弹窗就关掉（首页留给 login() 自己处理）
+        if str(url).rstrip('/') != "https://www.xiaohongshu.com":
+            await asyncio.sleep(1.5)
+            await _dismiss_login_modal(page)
         return resp
 
     def _on_nav(frame):
@@ -853,11 +890,11 @@ async def _ime_type_group(page, hanzi: str) -> bool:
                                                        "windowsVirtualKeyCode": 229, "nativeVirtualKeyCode": 229})
             shown += ch
             await sess.send("Input.imeSetComposition", {"text": shown, "selectionStart": len(shown), "selectionEnd": len(shown)})
-            await asyncio.sleep(_random.uniform(0.07, 0.13))
+            await asyncio.sleep(_random.uniform(0.06, 0.11))
             await sess.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": ch, "code": code,
                                                        "windowsVirtualKeyCode": ord(ch.upper()), "nativeVirtualKeyCode": ord(ch.upper())})
-            await asyncio.sleep(max(0.03, _random.lognormvariate(-2.5, 0.5)))  # 按键周期（按住0.1+此间隔）中位约 0.18s，与真人实录 185ms 一致
-        await asyncio.sleep(_random.uniform(0.15, 0.6))  # 看一眼候选词
+            await asyncio.sleep(max(0.03, _random.lognormvariate(-3.0, 0.5)))  # 按键周期（按住~0.085+此间隔）中位约 0.13s：真人实录 185ms 偏慢，实测可适当加快
+        await asyncio.sleep(_random.uniform(0.1, 0.4))  # 看一眼候选词
         await sess.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", "key": "Process", "code": "Space",
                                                    "windowsVirtualKeyCode": 229, "nativeVirtualKeyCode": 229})
         await sess.send("Input.insertText", {"text": hanzi})
@@ -908,18 +945,18 @@ async def _human_type(page, text: str, wpm: int = None, soft_newline: bool = Fal
                 j += 1
             if not await _ime_type_group(page, text[i:j]):
                 await page.keyboard.insert_text(text[i:j])
-            await asyncio.sleep(_random.uniform(0.3, 1.2))
+            await asyncio.sleep(_random.uniform(0.15, 0.7))
             i = j
         elif ch in '。，！？、；：…“”‘’（）《》～—':
             await page.keyboard.insert_text(ch)
-            await asyncio.sleep(_random.uniform(0.4, 1.0))
+            await asyncio.sleep(_random.uniform(0.25, 0.6))
             i += 1
         else:
             await _key_char(page, ch)
             await asyncio.sleep(_random.uniform(0.08, 0.25) if ch not in '.,!?' else _random.uniform(0.3, 0.7))
             i += 1
-        if _random.random() < 0.06:
-            await asyncio.sleep(_random.uniform(1.5, 3.5))
+        if _random.random() < 0.04:
+            await asyncio.sleep(_random.uniform(1.2, 2.8))
 
 async def _get_user_avatar_key(page, user_hex_id: str) -> str:
     """导航到用户主页，提取其头像 CDN key（用于 picker 精确匹配）。"""
@@ -1101,9 +1138,118 @@ async def _quick_comments(page, limit: int = 15) -> str:
 # 初始化 FastMCP 服务器
 mcp = FastMCP("xiaohongshu_scraper", lifespan=lambda server: _lifespan(server))
 
+# ── 调用日志：每次工具调用一行，写 ~/xhs-calls.log（1MB × 3 份轮转）─────────────
+# 格式：时间 | 工具 | 状态 | 耗时 | 参数 | 结果摘要。状态：ok / 未登录 / 限速 / 熔断 / 空结果 / 出错
+# 想快速看今天的调用：tail -n 50 ~/xhs-calls.log；只看出问题的：grep -v " ok " ~/xhs-calls.log
+import functools as _functools
+import logging as _logging
+from logging.handlers import RotatingFileHandler as _RFH
+
+_call_log = _logging.getLogger("xhs_calls")
+if not _call_log.handlers:
+    _h = _RFH(os.path.expanduser(os.environ.get("XHS_CALL_LOG", "~/xhs-calls.log")), maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    _h.setFormatter(_logging.Formatter("%(message)s"))
+    _call_log.addHandler(_h)
+    _call_log.setLevel(_logging.INFO)
+    _call_log.propagate = False
+
+
+def _call_status(res) -> str:
+    t = res if isinstance(res, str) else str(res)
+    head = t[:200]
+    if head.startswith("⏳"):
+        return "限速"
+    if "🛑" in head or "熔断" in head[:40]:
+        return "熔断"
+    if "未登录" in head or "请先登录" in head:
+        return "未登录"
+    if "未找到" in head or "暂无" in head or "没有" in head[:12]:
+        return "空结果"
+    if head.startswith(("获取", "打开")) and ("失败" in head or "出错" in head):
+        return "出错"
+    return "ok"
+
+
+def _short(v, n=40) -> str:
+    t = str(v).replace("\n", " ")
+    return t if len(t) <= n else t[:n] + "…"
+
+
+def _logged(fn):
+    _is_async = asyncio.iscoroutinefunction(fn)
+
+    @_functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        t0 = _time.time()
+        arg_s = " ".join(f"{k}={_short(v)}" for k, v in kwargs.items())
+        try:
+            res = await fn(*args, **kwargs) if _is_async else fn(*args, **kwargs)
+        except BaseException as e:
+            try:
+                _call_log.info(f"{datetime.now():%m-%d %H:%M:%S} | {fn.__name__} | 出错 | {_time.time()-t0:.1f}s | {arg_s} | {type(e).__name__}: {_short(e, 120)}")
+            except Exception:
+                pass
+            raise
+        try:
+            _call_log.info(f"{datetime.now():%m-%d %H:%M:%S} | {fn.__name__} | {_call_status(res)} | {_time.time()-t0:.1f}s | {arg_s} | {_short(res, 60)}")
+        except Exception:
+            pass
+        return res
+    return wrapper
+
+
+_orig_mcp_tool = mcp.tool
+
+
+def _tool_with_log(*a, **k):
+    _dec = _orig_mcp_tool(*a, **k)
+    return lambda fn: _dec(_logged(fn))
+
+
+mcp.tool = _tool_with_log
+
+# ── 参数名兼容中间件：旧名/常猜错的名字在校验前换成正式名，参数说明里只露出正式名 ──
+from fastmcp.server.middleware import Middleware as _Middleware
+
+_ARG_ALIASES = {
+    "search_notes": {"keyword": "keywords"},
+    "search_user": {"keyword": "keywords"},
+    "read_chat": {"chat_user_id": "user"},
+    "post_comment": {"comment": "content", "url": "note", "note_id": "note"},
+    "get_note_content": {"url": "note", "note_id": "note"},
+    "get_note_comments": {"url": "note", "note_id": "note"},
+    "get_note_images": {"url": "note", "note_id": "note"},
+    "like_note": {"note_id": "note", "url": "note"},
+    "favorite_note": {"note_id": "note", "url": "note"},
+    "like_comment": {"note_id": "note", "url": "note"},
+    "reply_comment": {"note_id": "note", "url": "note"},
+    "delete_note": {"note_id": "note"},
+    "add_comment_history": {"note_id": "note", "url": "note"},
+    "get_comment_history": {"note_id": "note", "url": "note"},
+    "follow_user": {"user_id": "user"},
+    "get_user_notes": {"user_id": "user"},
+}
+
+
+class _ArgAlias(_Middleware):
+    async def on_call_tool(self, context, call_next):
+        try:
+            args = context.message.arguments
+            amap = _ARG_ALIASES.get(context.message.name)
+            if amap and isinstance(args, dict):
+                for old, new in amap.items():
+                    if old in args and new not in args:
+                        args[new] = args.pop(old)
+        except Exception as e:
+            print(f"[alias] 参数别名处理出错：{e}", file=sys.stderr, flush=True)
+        return await call_next(context)
+
+
+mcp.add_middleware(_ArgAlias())
+
 # 全局变量
 _DIR = os.path.dirname(os.path.abspath(__file__))
-BROWSER_DATA_DIR = os.path.join(_DIR, "browser_data")
+BROWSER_DATA_DIR = os.environ.get("XHS_CHROME_PROFILE") or os.path.expanduser("~/chrome-real")
 DATA_DIR = os.path.join(_DIR, "data")
 XHS_MCP_DB = os.path.expanduser("~/.xhs-mcp/data.db")
 ACTIONS_DB = os.path.join(_DIR, "xhs_actions.db")
@@ -1256,6 +1402,69 @@ def _add_cached_token(url: str) -> str:
     return url
 
 
+_HEX24_RE = re.compile(r'^[0-9a-f]{24}$')
+_MY_ID_FILE = os.path.expanduser("~/.xhs_my_user_id")
+
+
+def _note_id_token(note: str, xsec_token: str = ""):
+    """工具入口统一的 note 参数 → (note_id, xsec_token)。note 可以是完整链接或 24 位 id；
+    链接里的 token 会被取出并缓存，只给 id 时 token 由调用方继续走缓存。"""
+    note = (note or "").strip()
+    m = re.search(r'/(?:explore|discovery/item|item)/([0-9a-f]{24})', note) or re.search(r'/user/profile/[0-9a-f]{24}/([0-9a-f]{24})', note)
+    nid = m.group(1) if m else note
+    t = re.search(r'xsec_token=([^&#]+)', note)
+    tok = xsec_token or (t.group(1) if t else "")
+    if _HEX24_RE.match(nid) and tok:
+        _remember_note_token(nid, tok)
+    return nid, tok
+
+
+def _note_url(note: str) -> str:
+    """note 参数 → 可访问的笔记链接：给 24 位 id 就拼 explore 链接，并用缓存补 token。"""
+    note = (note or "").strip()
+    if _HEX24_RE.match(note):
+        return _add_cached_token(f"https://www.xiaohongshu.com/explore/{note}")
+    return note
+
+
+async def _my_user_id() -> str:
+    """当前登录账号自己的 hex user id：优先读缓存文件，没有就从侧栏"我"的链接里读一次并存下。"""
+    try:
+        v = open(_MY_ID_FILE).read().strip()
+        if _HEX24_RE.match(v):
+            return v
+    except Exception:
+        pass
+    page = main_page
+    if page is None or page.is_closed():
+        return ""
+    if "www.xiaohongshu.com" not in (page.url or ""):
+        await page.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded", timeout=30000)
+        await _rand_sleep(2.5)
+    uid = await page.evaluate("""() => {
+        const pick = a => { const m = (a.getAttribute('href') || '').match(/\/user\/profile\/([0-9a-f]{24})/); return m ? m[1] : ''; };
+        for (const a of document.querySelectorAll('a[href*="/user/profile/"]'))
+            if (a.closest('.side-bar, .sidebar, .channel-list, nav') && pick(a)) return pick(a);
+        for (const a of document.querySelectorAll('a'))
+            if ((a.innerText || '').trim() === '我' && pick(a)) return pick(a);
+        return '';
+    }""")
+    if uid:
+        try:
+            open(_MY_ID_FILE, "w").write(uid)
+        except Exception:
+            pass
+    return uid or ""
+
+
+async def _resolve_user(user: str) -> str:
+    """user 参数：'me'/'自己'/'我' → 自己的 hex id；其余原样（数字号或 hex id）。"""
+    u = (user or "").strip()
+    if u.lower() in ("me", "self", "自己", "我"):
+        return await _my_user_id() or u
+    return u
+
+
 _EXPAND_REPLY_RE = "text=/展开\\s*\\d*\\s*条回复|展开更多回复|查看更多回复/"
 
 
@@ -1362,11 +1571,26 @@ async def _ensure_chrome_running():
     if _cdp_alive():
         return
     env = os.environ.copy()
+    # 桌面会话的 DISPLAY/XAUTHORITY 会变（重启后 GDM 登录界面占 :0，用户会话成了 :1），
+    # 服务环境里写死的 :0 会让 Chrome 开不出窗口 → "启动超时"。从 gnome-shell 进程读真实值。
+    try:
+        import subprocess as _sp
+        _pid = _sp.run(["pgrep", "-u", str(os.getuid()), "-x", "gnome-shell"], capture_output=True, text=True, timeout=3).stdout.split()
+        if _pid:
+            with open(f"/proc/{_pid[0]}/environ", "rb") as _f:
+                _se = dict(kv.split("=", 1) for kv in _f.read().decode(errors="ignore").split("\0") if "=" in kv)
+            # XDG_CURRENT_DESKTOP/DESKTOP_SESSION 必须带上：Chrome 靠它选 cookie 加密的密钥环后端，缺了就读不出桌面写的 v11 cookie，登录态被清空
+            for _k in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "DESKTOP_SESSION", "GNOME_DESKTOP_SESSION_ID"):
+                if _se.get(_k):
+                    env[_k] = _se[_k]
+    except Exception as _e:
+        print(f"[chrome] 读桌面环境失败，沿用服务环境：{_e}", file=sys.stderr, flush=True)
     env.setdefault("DISPLAY", ":0")
+    print(f"[chrome] 启动 DISPLAY={env.get('DISPLAY')}", file=sys.stderr, flush=True)
     # 这台机器的核显(Intel Ironlake)只有 OpenGL 2.1，Chrome 用不了 → WebGL 整个没有，是很可疑的环境特征。
     # 让 Chrome 走独显(NVIDIA GT 415M / nouveau，OpenGL 4.3)，WebGL/GPU 合成就都有了（2026-10-11 本机实测）。
     env.setdefault("DRI_PRIME", "1")
-    subprocess.Popen(
+    _proc = subprocess.Popen(
         [
             "/usr/bin/google-chrome",
             f"--remote-debugging-port={CDP_PORT}",
@@ -1379,14 +1603,20 @@ async def _ensure_chrome_running():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    for _ in range(20):
+    import threading as _th
+    _th.Thread(target=_proc.wait, daemon=True).start()  # 回收子进程，Chrome 退出后不留 <defunct>
+    for _ in range(80):  # 冷启动（80 个域名的 profile + 扩展，老 CPU）可能超过 10 秒，等到 40 秒
         await asyncio.sleep(0.5)
         if _cdp_alive():
             return
-    raise RuntimeError("Chrome 启动超时，请手动确认 Chrome 是否可以运行")
+    raise RuntimeError(
+        f"Chrome 启动超时（profile: {BROWSER_DATA_DIR}）。"
+        "常见原因：该 profile 已被普通方式启动的 Chrome 占用（SingletonLock）。"
+        f"请先完全退出 Chrome，再用带 --remote-debugging-port={CDP_PORT} 的启动脚本打开。"
+    )
 
 
-async def ensure_browser(_from_idle: bool = False):
+async def ensure_browser(_from_idle: bool = False, require_login: bool = True):
     """确保浏览器已连接（CDP 模式连接真实 Chrome）。
     若连接已断开则自动重连，无需手动重启 MCP。"""
     global browser_instance, browser_obj, browser_context, main_page, is_logged_in
@@ -1431,7 +1661,9 @@ async def ensure_browser(_from_idle: bool = False):
         notifications_page = None
 
     if browser_context is None:
+        _t0 = _time.time()
         await _ensure_chrome_running()
+        print(f"[cold] Chrome 就绪 {_time.time()-_t0:.1f}s", file=sys.stderr, flush=True)
 
         browser_instance = await async_playwright().start()
         # 连接到真实 Chrome（使用其现有 profile，无需 storage_state）
@@ -1469,11 +1701,15 @@ async def ensure_browser(_from_idle: bool = False):
     if not is_logged_in:
         if main_page:
             try:
+                _t1 = _time.time()
                 await main_page.goto("https://www.xiaohongshu.com", timeout=60000)
+                print(f"[cold] 首页 goto {_time.time()-_t1:.1f}s", file=sys.stderr, flush=True)
                 await _rand_sleep(3)
                 login_elements = await main_page.query_selector_all('text="登录"')
                 if login_elements:
-                    return False
+                    # 浏览类工具不要求登录：关掉弹窗直接放行；发帖/点赞等仍需登录
+                    await _dismiss_login_modal(main_page)
+                    return not require_login
                 else:
                     is_logged_in = True
                     return True
@@ -1937,6 +2173,73 @@ async def _idle_loop():
         await asyncio.sleep(_random.uniform(*IDLE_GAP_HOURS) * 3600)
 
 
+# ── 空闲自动关 Chrome ────────────────────────────────────────────────────
+# 看门狗和闲逛都关着时，MCP 一小时没被用过就把 Chrome 关掉（省内存，这台 CPU 老）；下次调用工具会自动重新拉起。
+# 环境变量 XHS_AUTOCLOSE_MIN 可改分钟数，0 = 不自动关。
+# 桌面日常 Chrome 和 MCP 共用同一个进程：若有非小红书标签页（说明有人在用），不关。
+XHS_AUTOCLOSE_MIN = int(os.environ.get("XHS_AUTOCLOSE_MIN", "60"))
+_autoclose_started = False
+_proc_start_ts = _time.time()
+
+
+def _cdp_foreign_tabs() -> list:
+    """返回非小红书/非空白的标签页 URL（说明有人在用 Chrome 做别的事）。查询失败时保守地当作有。"""
+    import urllib.request
+    try:
+        tabs = json.loads(urllib.request.urlopen(f"{CDP_URL}/json", timeout=3).read())
+    except Exception:
+        return ["<查询失败>"]
+    out = []
+    for t in tabs:
+        if t.get("type") != "page":
+            continue
+        u = t.get("url", "")
+        if "xiaohongshu.com" in u or u.startswith("about:blank") or u.startswith("chrome://newtab") or u.startswith("chrome-search://"):
+            continue
+        out.append(u)
+    return out
+
+
+async def _autoclose_chrome():
+    """优雅关闭 Chrome（CDP Browser.close，cookie 会落盘），并重置连接状态。"""
+    global browser_instance, browser_obj, browser_context, main_page, notifications_page, is_logged_in
+    try:
+        sess = await browser_obj.new_browser_cdp_session()
+        await sess.send("Browser.close")
+    except Exception as e:
+        print(f"[autoclose] Browser.close 出错（可能已关）：{e}", file=sys.stderr, flush=True)
+    try:
+        if browser_instance is not None:
+            await browser_instance.stop()
+    except Exception:
+        pass
+    browser_instance = None
+    browser_obj = None
+    browser_context = None
+    main_page = None
+    notifications_page = None
+    is_logged_in = False
+
+
+async def _autoclose_loop():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if XHS_AUTOCLOSE_MIN <= 0 or browser_context is None or not _cdp_alive():
+                continue
+            idle = _time.time() - max(_last_tool_ts, _proc_start_ts)
+            if idle < XHS_AUTOCLOSE_MIN * 60:
+                continue
+            foreign = _cdp_foreign_tabs()
+            if foreign:
+                print(f"[autoclose] 空闲 {int(idle/60)} 分钟，但有非小红书标签页，不关：{foreign[:2]}", file=sys.stderr, flush=True)
+                continue
+            print(f"[autoclose] 空闲 {int(idle/60)} 分钟，关闭 Chrome", file=sys.stderr, flush=True)
+            await _autoclose_chrome()
+        except Exception as e:
+            print(f"[autoclose] 出错：{e}", file=sys.stderr, flush=True)
+
+
 @_asynccontextmanager
 async def _lifespan(server):
     global _idle_started
@@ -1949,17 +2252,25 @@ async def _lifespan(server):
         _watch_started = True
         asyncio.get_running_loop().create_task(_watch_loop())
         print(f"[watch] 通知看门狗已启动，日志 {XHS_WAKE_LOG}，关联号 {len(XHS_PRIORITY)} 个", file=sys.stderr, flush=True)
+    global _autoclose_started
+    if not _autoclose_started and not XHS_WATCH_ON and os.environ.get("XHS_IDLE", "1") == "0" and XHS_AUTOCLOSE_MIN > 0:
+        _autoclose_started = True
+        asyncio.get_running_loop().create_task(_autoclose_loop())
+        print(f"[autoclose] 空闲 {XHS_AUTOCLOSE_MIN} 分钟自动关 Chrome 已启动", file=sys.stderr, flush=True)
     yield
 
 
 @mcp.tool()
-async def follow_user(user_id: str, xsec_token: str = "") -> str:
+async def follow_user(user: str, xsec_token: str = "") -> str:
     """关注一个用户。会先在对方主页看一会儿笔记再点关注，已关注的不会重复点。
 
+    示例: follow_user(user="hex id")
+
     Args:
-        user_id: 用户 hex ID（如 63a6d4e70000000026007f5e，来自 search_user / 通知 / 笔记作者）
+        user: 小红书号（纯数字）或 hex id
         xsec_token: 用户主页的 xsec_token，可留空（search_user 查过的会自动用缓存）
     """
+    user_id = user
     _rl = _RateLimit.check('follow')
     if _rl:
         return _rl
@@ -2101,6 +2412,8 @@ async def _search_via_ui(page, keywords: str) -> bool:
 async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) -> str:
     """根据关键词搜索笔记。没有直链、只有关键词时使用。已有笔记链接时直接用 get_note_content，不要用搜索代替。
 
+    示例: search_notes(keywords="人机恋", limit=5)
+
     Args:
         keywords: 搜索关键词
         limit: 返回结果数量限制（默认20，最多100）
@@ -2111,9 +2424,11 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
     if _rl:
         return _rl
 
-    login_status = await ensure_browser()
+    login_status = await ensure_browser(require_login=False)
     if not login_status:
         return "请先登录小红书账号"
+    if not is_logged_in:
+        return "⚠️ 小红书当前是未登录（游客）状态，搜索会返回空结果。请先在 Chrome 里扫码登录后再试。"
 
     if not main_page:
         return "浏览器初始化失败，请重试"
@@ -2208,20 +2523,26 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
         return f"搜索笔记时出错: {str(e)}"
 
 @mcp.tool()
-async def get_note_content(url: str, include_images: bool = True, include_comments: bool = True) -> Any:
+async def get_note_content(note: str, include_images: bool = True, include_comments: bool = True) -> Any:
     """获取笔记正文、配图和前15条评论，一次调用返回完整内容。有笔记链接时首选此工具，不要用 search_notes 代替。
     支持完整链接（xiaohongshu.com/explore/...）和短链（xhslink.cn/...）。
     如需获取更多评论，再单独调用 get_note_comments。
 
+    示例: get_note_content(note="笔记链接或 24 位 id", include_comments=False)  # 私信分享的笔记，用 read_chat 给的"链接:"那行
+
     Args:
-        url: 笔记 URL
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
         include_images: 是否处理配图（默认 True）。
             ≤4张：下载到本地，返回路径供 AI 直接读取图片内容；
             >4张：调用 Gemini 3.6 Flash 分析图片，返回文字描述。
         include_comments: 是否顺带返回前15条评论（默认 True）。只想看正文、不需要评论时传 False。
     """
+    url = _note_url(note)
+    _rg = _read_gate()
+    if _rg:
+        return _rg
     _attach_paths = []
-    login_status = await ensure_browser()
+    login_status = await ensure_browser(require_login=False)
     if not login_status:
         return "请先登录小红书账号"
     
@@ -2230,7 +2551,7 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
         
     try:
         # 使用通用URL处理函数
-        processed_url = process_url(url)
+        processed_url = _add_cached_token(process_url(url))  # 链接没带 xsec_token 时用缓存补
         print(f"处理后的URL: {processed_url}")
         
         # 访问帖子链接，保留完整参数
@@ -2339,10 +2660,10 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
                 if not main_page:  # 添加空检查
                     return "浏览器初始化失败，请重试"
                     
-                title_element = await main_page.query_selector('div.title')
+                title_element = await main_page.query_selector('.note-content div.title, #noteContainer div.title')
                 if title_element:
                     title = await title_element.text_content()
-                    post_content["标题"] = title.strip() if title else "未知标题"
+                    post_content["标题"] = title.strip() if title and title.strip() != "温馨提示" else "未知标题"
                     print(f"方法2获取到标题: {post_content['标题']}")
                 else:
                     print("方法2未找到标题元素")
@@ -2361,9 +2682,9 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
                         // 尝试多种可能的标题选择器
                         const selectors = [
                             '#detail-title',
-                            'div.title',
-                            'h1',
-                            'div.note-content div.title'
+                            '.note-content div.title',
+                            '#noteContainer div.title',
+                            'h1'
                         ];
                         
                         for (const selector of selectors) {
@@ -2375,7 +2696,7 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
                         return null;
                     }
                 ''')
-                if title:
+                if title and title.strip() != "温馨提示":
                     post_content["标题"] = title
                     print(f"方法3获取到标题: {post_content['标题']}")
                 else:
@@ -2818,13 +3139,20 @@ async def get_note_content(url: str, include_images: bool = True, include_commen
         return f"获取笔记内容时出错: {str(e)}"
 
 @mcp.tool()
-async def get_note_comments(url: str) -> str:
+async def get_note_comments(note: str, limit: int = 0) -> str:
     """获取笔记评论列表。返回的 comment_id 可用于 reply_comment 和 like_comment。
 
+    示例: get_note_comments(note="笔记链接或 id", limit=20)  # 头部会写"页面共 N 条，读到 M 条"
+
     Args:
-        url: 笔记 URL
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
+        limit: 最多显示多少条一级评论（0=全部，默认）。只截断输出，页面浏览行为不变
     """
-    login_status = await ensure_browser()
+    url = _note_url(note)
+    _rg = _read_gate()
+    if _rg:
+        return _rg
+    login_status = await ensure_browser(require_login=False)
     if not login_status:
         return "请先登录小红书账号"
     
@@ -2949,10 +3277,26 @@ async def get_note_comments(url: str) -> str:
             _nid = _m.group(1) if _m else ''
             _tk = _note_token_cache.get(_nid, '')
             _total = sum(1 + len(t['replies']) for t in threads)
+            # 页面评论区标题里有总数（"共 72 条评论"），读出来对照，免得漏读还不知道
+            _page_total = None
+            try:
+                _txt = await main_page.evaluate("() => (document.querySelector('.comments-container .total, .comment-container .total, div.total') || {}).textContent || ''")
+                _mt = _re.search(r'共\s*(\d+)\s*条', _txt or '')
+                _page_total = int(_mt.group(1)) if _mt else None
+            except Exception:
+                pass
             result = f"笔记 note_id: {_nid}"
             if _tk:
                 result += f"  xsec_token: {_tk}"
-            result += f"\n共 {len(threads)} 条一级评论、{_total - len(threads)} 条楼中楼：\n\n"
+            result += f"\n共 {len(threads)} 条一级评论、{_total - len(threads)} 条楼中楼：\n"
+            if _page_total:
+                _gap = _page_total - _total
+                result += (f"（页面显示共 {_page_total} 条评论，本次读到 {_total} 条" +
+                           (f"，还有约 {_gap} 条没读到——评论区只滚动 8 次、楼中楼最多展开 8 处）\n" if _gap > 0 else "，已读全）\n"))
+            result += "\n"
+            if limit and limit > 0 and limit < len(threads):
+                result += f"（按 limit={limit} 只显示前 {limit} 条一级评论）\n\n"
+                threads = threads[:limit]
             for i, t in enumerate(threads, 1):
                 au = "[作者]" if t['is_author'] else ""
                 result += f"{i}. {t['user']}{au}（{t['time']}）: {t['content']}  [comment_id: {t['id']}]\n"
@@ -3095,18 +3439,22 @@ async def get_note_comments(url: str) -> str:
         return f"获取评论时出错: {str(e)}"
 
 @mcp.tool()
-async def post_comment(url: str, comment: str, force: bool = False) -> str:
+async def post_comment(note: str, content: str, force: bool = False) -> str:
     """发布评论到指定笔记。
     支持 @mention：
     - @昵称          → picker 昵称匹配（适合唯一昵称）
     - @昵称:hexid    → 先访问用户主页取头像，picker 头像精确匹配（适合同名场景）
       hexid 从 get_user_notes/search_notes 等工具的 URL 末段获取
 
+    示例: post_comment(note="笔记链接或 id", content="评论内容")
+
     Args:
-        url: 笔记 URL（支持短链）
-        comment: 评论内容，支持 @昵称 或 @昵称:hexid 格式
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
+        content: 评论内容，支持 @昵称 或 @昵称:hexid 格式
         force: 该笔记已评论过时默认拦截并提醒；确实要再评论一次时传 true
     """
+    url = _note_url(note)
+    comment = content  # 函数体内沿用 comment 变量名
     _rl = _RateLimit.check('comment')
     if _rl:
         return _rl
@@ -3301,7 +3649,7 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
             
         await _ensure_nl_route(main_page)
         await _type_with_at_mention(main_page, comment, avatar_map=avatar_map)
-        await _rand_sleep(1)
+        await _rand_sleep(1.5)  # 真人实录：打完到点发送 1.8–2.8s（可适当加快）
 
         # 发送评论（简化发送逻辑）
         send_success = False
@@ -3361,23 +3709,24 @@ async def post_comment(url: str, comment: str, force: bool = False) -> str:
         return f"发布评论时出错: {str(e)}"
 
 @mcp.tool()
-async def get_note_images(url: str) -> Any:
+async def get_note_images(note: str) -> Any:
     """仅获取笔记图片（不含正文、评论）。通常不需要单独调用——get_note_content 已内置图片处理。
     适用场景：只需要图片、不需要正文和评论时。走已登录的浏览器打开笔记页，
     链接没带 xsec_token 时会自动用缓存补上（search_notes/list_feeds/通知看过的笔记都有缓存）。
 
     Args:
-        url: 笔记 URL（完整链接；带不带 xsec_token 都行，没带且缓存里也没有时可能被拦截）
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
 
     Returns:
         dict: 包含笔记基本信息和本地图片路径列表
     """
+    url = _note_url(note)
     _rl = _RateLimit.check('image_fetch')
     if _rl:
         return {"error": _rl}
     _RateLimit.record('image_fetch')
 
-    login_status = await ensure_browser()
+    login_status = await ensure_browser(require_login=False)
     if not login_status:
         return {"error": "请先登录小红书账号"}
     if not main_page:
@@ -3473,6 +3822,8 @@ async def get_notifications(tab: str = "comments", limit: int = 20, only_unrepli
     """获取小红书通知（评论@、赞和收藏、新增关注）
     评论通知会自动对照回复记录，回过的标"✅ 已回复"。想省 token 时用 only_unreplied=True 只看没回的。
 
+    示例: get_notifications(tab="comments", limit=10, only_unreplied=True)  # tab: comments / likes / follows
+
     Args:
         tab: 通知类型，可选 "comments"（评论和@）、"likes"（赞和收藏）、"follows"（新增关注）。默认 "comments"。
         limit: 最多返回条数，默认 20。
@@ -3480,6 +3831,9 @@ async def get_notifications(tab: str = "comments", limit: int = 20, only_unrepli
         verbose: 评论通知默认用精简格式（按笔记分组、不带链接和 token，回复/点赞时 token 会自动补）；
             True 时输出带链接、token、被回复评论 ID 的完整格式。
     """
+    _rg = _read_gate()
+    if _rg:
+        return _rg
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号"
@@ -3735,22 +4089,27 @@ async def _open_profile_human(page, hex_id: str, token: str):
 
 
 @mcp.tool()
-async def search_user(keyword: str) -> str:
+async def search_user(keywords: str) -> str:
     """搜索小红书用户，返回匹配用户的昵称、hex ID 和 xsec_token。
 
     支持按小红书号（纯数字）或昵称搜索。小红书号搜索结果精确唯一；
     昵称搜索可能返回多个同名用户，需人工确认。
 
+    示例: search_user(keywords="某某")
+
     Args:
         keyword: 小红书号（如 1103700607）或用户昵称
     """
+    keyword = keywords
     _rl = _RateLimit.check('search')
     if _rl:
         return _rl
 
-    login_status = await ensure_browser()
+    login_status = await ensure_browser(require_login=False)
     if not login_status:
         return "请先登录小红书账号"
+    if not is_logged_in:
+        return "⚠️ 小红书当前是未登录（游客）状态，搜索会返回空结果。请先在 Chrome 里扫码登录后再试。"
     if not main_page:
         return "浏览器初始化失败，请重试"
 
@@ -3844,15 +4203,21 @@ async def search_user(keyword: str) -> str:
 
 
 @mcp.tool()
-async def get_user_notes(user_id: str, xsec_token: str = "", limit: int = 20) -> str:
+async def get_user_notes(user: str, xsec_token: str = "", limit: int = 20) -> str:
     """获取指定用户主页的笔记列表。
 
+    示例: get_user_notes(user="小红书号或 hex id", limit=10)；看自己主页：get_user_notes(user="me")
+
     Args:
-        user_id: 小红书号（纯数字，自动搜索）或用户 hex ID（如 5f1a2b3c0000000001000abc）。
+        user: 小红书号（纯数字）或 hex id；传 "me"/"自己" 看当前登录账号自己的主页
         xsec_token: 一般不需要传，传小红书号时自动获取，传 hex ID 时从缓存取。
         limit: 最多返回笔记数，默认 20
     """
-    login_status = await ensure_browser()
+    user_id = await _resolve_user(user)
+    _rg = _read_gate()
+    if _rg:
+        return _rg
+    login_status = await ensure_browser(require_login=False)
     if not login_status:
         return "请先登录小红书账号"
     if not main_page:
@@ -4033,7 +4398,10 @@ async def list_feeds(limit: int = 20, verbose: bool = False) -> str:
         limit: 返回条数，默认 20，最多 100
         verbose: False（默认）只返回标题、作者、点赞、链接；True 额外返回 xsecToken
     """
-    login_status = await ensure_browser()
+    _rg = _read_gate()
+    if _rg:
+        return _rg
+    login_status = await ensure_browser(require_login=False)
     if not login_status:
         return "请先登录小红书账号"
     if not main_page:
@@ -4099,11 +4467,14 @@ async def list_feeds(limit: int = 20, verbose: bool = False) -> str:
 
 @mcp.tool()
 async def get_my_notes(limit: int = 50) -> str:
-    """获取自己已发布的笔记列表。返回链接末段即为 note_id，可直接用于 delete_note。
+    """获取自己已发布的笔记列表。返回的链接可直接传给 delete_note(note=...)。
 
     Args:
         limit: 最多返回条数，默认 50
     """
+    _rg = _read_gate()
+    if _rg:
+        return _rg
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号"
@@ -4247,14 +4618,17 @@ async def _navigate_note(note_id: str, xsec_token: str = "") -> tuple:
 
 
 @mcp.tool()
-async def like_note(note_id: str, xsec_token: str = "", unlike: bool = False) -> str:
-    """点赞或取消点赞一篇笔记。note_id 和 xsec_token 从 search_notes(verbose=True) 或 list_feeds(verbose=True) 获取。
+async def like_note(note: str, xsec_token: str = "", unlike: bool = False) -> str:
+    """点赞或取消点赞一篇笔记。note 直接传 search_notes / list_feeds 返回的笔记链接即可（链接里自带 xsec_token）。
+
+    示例: like_note(note="笔记链接或 id")
 
     Args:
-        note_id: 笔记 ID（从搜索结果或 feed 获取）
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
         xsec_token: 笔记的 xsec_token（从搜索结果或 feed 获取，可留空）
         unlike: True 为取消点赞，默认 False（点赞）
     """
+    note_id, xsec_token = _note_id_token(note, xsec_token)
     _rl = _RateLimit.check('like')
     if _rl:
         return _rl
@@ -4300,14 +4674,17 @@ async def like_note(note_id: str, xsec_token: str = "", unlike: bool = False) ->
 
 
 @mcp.tool()
-async def favorite_note(note_id: str, xsec_token: str = "", unfavorite: bool = False) -> str:
-    """收藏或取消收藏一篇笔记。note_id 和 xsec_token 从 search_notes(verbose=True) 或 list_feeds(verbose=True) 获取。
+async def favorite_note(note: str, xsec_token: str = "", unfavorite: bool = False) -> str:
+    """收藏或取消收藏一篇笔记。note 直接传 search_notes / list_feeds 返回的笔记链接即可（链接里自带 xsec_token）。
+
+    示例: favorite_note(note="笔记链接或 id")
 
     Args:
-        note_id: 笔记 ID（从搜索结果或 feed 获取）
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
         xsec_token: 笔记的 xsec_token（从搜索结果或 feed 获取，可留空）
         unfavorite: True 为取消收藏，默认 False（收藏）
     """
+    note_id, xsec_token = _note_id_token(note, xsec_token)
     _rl = _RateLimit.check('like')
     if _rl:
         return _rl
@@ -4432,8 +4809,7 @@ async def _reply_via_notification(comment_id: str, content: str):
         return True, f"⚠️ 发送过程中出错：{e}。可能已发出，请到浏览器确认（未自动重试，避免重复）。"
 
 
-@mcp.tool()
-async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token: str = "", force: bool = False) -> str:
+async def _reply_comment_impl(note_id: str, comment_id: str, content: str, xsec_token: str = "", force: bool = False) -> str:
     """回复笔记下的某条评论。
 
     Args:
@@ -4463,20 +4839,30 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
     # 优先在通知页直接回复（别人回我的评论都在通知里），找不到再打开笔记页
     if not await ensure_browser():
         return "请先登录小红书账号"
+    _handled, _msg, _recorded = False, '', False
     try:
         async with _notif_page_lock:
             try:
                 _handled, _msg = await _reply_via_notification(comment_id, content)
+                if _handled and _msg.startswith('✅'):
+                    # 发出去了就先记账：后面"离开通知页"卡住（10-22 的 300s 超时就是这类）也不会漏记、不会被当成没发
+                    _record_comment('replied', note_id, comment_id=comment_id, content=content)
+                    _RateLimit.record('reply')
+                    _recorded = True
             finally:
                 if main_page is not None and not main_page.is_closed():
-                    await _watch_leave_notifications(main_page)  # 回复完回首页，页面不一直停在通知页
+                    try:  # 回复完回首页；限时 30s，失败也不影响已发出的回复
+                        await asyncio.wait_for(_watch_leave_notifications(main_page), 30)
+                    except Exception as _le:
+                        print(f"[notif_reply] 离开通知页出错/超时（回复已处理）：{_le}", file=sys.stderr, flush=True)
     except _RiskBlocked:
         raise
     except Exception as e:
         print(f"[notif_reply] 通知页回复失败，改走笔记页：{e}", file=sys.stderr, flush=True)
-        _handled, _msg = False, ''
+        if not _recorded:  # 已经发出并记账的，绝不能再走笔记页重发一遍
+            _handled, _msg = False, ''
     if _handled:
-        if _msg.startswith('✅'):
+        if _msg.startswith('✅') and not _recorded:
             _record_comment('replied', note_id, comment_id=comment_id, content=content)
             _RateLimit.record('reply')
         return f"{_reply_history_prefix}{_msg}"
@@ -4549,15 +4935,39 @@ async def reply_comment(note_id: str, comment_id: str, content: str, xsec_token:
 
 
 @mcp.tool()
-async def add_comment_history(note_id: str, content: str, action_type: str = "commented", comment_id: str = "") -> str:
+async def reply_comment(note: str, comment_id: str, content: str, xsec_token: str = "", force: bool = False) -> str:
+    """回复笔记下的某条评论。
+
+    示例: reply_comment(note="笔记链接或 id", comment_id="来自 get_note_comments", content="回复内容")
+
+    Args:
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
+        comment_id: 要回复的评论 ID（从 get_note_comments 获取）
+        content: 回复内容
+        xsec_token: 笔记的 xsec_token（可留空，会用缓存）
+        force: 该评论已回复过时默认拦截并提醒；确实要再回一次时传 true
+
+    整个流程有 240 秒总时限；超时返回会明确提示"可能已发出"，此时先用 get_comment_history 或到页面确认，别直接重发。
+    """
+    note_id, xsec_token = _note_id_token(note, xsec_token)
+    try:
+        return await asyncio.wait_for(_reply_comment_impl(note_id, comment_id, content, xsec_token, force), 240)
+    except asyncio.TimeoutError:
+        return ("⚠️ 回复流程超过 240 秒仍没结束。回复**可能已经发出去了**（10-22 出现过发出后才卡住）。"
+                "请先 get_comment_history(note_id) 看有没有记录，或到页面确认，**不要直接重发**。")
+
+
+@mcp.tool()
+async def add_comment_history(note: str, content: str, action_type: str = "commented", comment_id: str = "") -> str:
     """手动补录一条评论/回复历史（漏记时用）。
 
     Args:
-        note_id: 笔记 ID
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
         content: 评论/回复内容
         action_type: commented（一级评论）或 replied（回复某条评论，需填 comment_id 为被回复的评论 ID）
         comment_id: replied 时必填；commented 时可填自己那条评论的 ID
     """
+    note_id, _ = _note_id_token(note)
     if action_type not in ("commented", "replied"):
         return "action_type 只能是 commented 或 replied"
     if action_type == "replied" and not comment_id:
@@ -4567,13 +4977,16 @@ async def add_comment_history(note_id: str, content: str, action_type: str = "co
 
 
 @mcp.tool()
-async def get_comment_history(note_id: str = "", limit: int = 20) -> str:
+async def get_comment_history(note: str = "", limit: int = 20) -> str:
     """查询自己的评论/回复历史。可用于检查某篇笔记是否已评论过。
 
+    示例: get_comment_history(note="笔记链接或 id")  # 查某篇是否已评论/回复过
+
     Args:
-        note_id: 筛选特定笔记（留空查全部最近记录）
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
         limit: 返回条数，默认 20
     """
+    note_id, _ = _note_id_token(note)
     try:
         records = _get_comment_history(note_id=note_id)
         records = records[:limit]
@@ -4593,15 +5006,18 @@ async def get_comment_history(note_id: str = "", limit: int = 20) -> str:
 
 
 @mcp.tool()
-async def like_comment(note_id: str, comment_id: str, xsec_token: str = "", unlike: bool = False) -> str:
+async def like_comment(note: str, comment_id: str, xsec_token: str = "", unlike: bool = False) -> str:
     """点赞或取消点赞笔记下的某条评论。
 
+    示例: like_comment(note="笔记链接或 id", comment_id="来自 get_note_comments")
+
     Args:
-        note_id: 笔记 ID
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
         comment_id: 评论 ID
         xsec_token: 笔记的 xsec_token
         unlike: True 为取消点赞
     """
+    note_id, xsec_token = _note_id_token(note, xsec_token)
     _rl = _RateLimit.check('like')
     if _rl:
         return _rl
@@ -4732,6 +5148,21 @@ async def _pub_click(page, selector: str, text: str = "", timeout: float = 10.0)
         if pos:
             await _human_click(page, x=pos[0], y=pos[1])
             return True
+        # 视口内没有：可能在折叠线下面（窗口矮）。找一个在页面里、横向在屏幕内、位置在下方的节点，
+        # 交给 _human_click(element=…)，它会先用真滚轮把元素滚进视口再点。
+        if asyncio.get_event_loop().time() - t0 > 2.0:
+            h = await page.evaluate_handle("""([sel, txt]) => {
+                for (const e of document.querySelectorAll(sel)) {
+                    if (txt && (e.innerText || '').trim() !== txt) continue;
+                    const r = e.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 && r.left >= 0 && r.left < innerWidth && r.top >= innerHeight) return e;
+                }
+                return null;
+            }""", [selector, text])
+            el = h.as_element()
+            if el:
+                await _human_click(page, element=el)
+                return True
         await asyncio.sleep(0.5)
     return False
 
@@ -4753,7 +5184,7 @@ async def _upload_files_human(page, paths) -> bool:
 
 
 async def _fill_and_publish(page, title: str, content: str, tags: list,
-                            text_card_mode: bool = False) -> str:
+                            text_card_mode: bool = False, draft: bool = False) -> str:
     """填写标题、正文、标签，然后点发布。供两种模式复用。"""
     await _rand_sleep(1.0)
 
@@ -4809,7 +5240,11 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
                 await page.keyboard.press("Space")
             await _rand_sleep(0.4)
 
-    await _rand_sleep(1.0)
+    await _rand_sleep(4.5)  # 真人实录：最后检查一遍再点发布，点前约 14s 没有操作；这里取 2.7–6.3s（可适当加快）
+
+    if draft:  # 只填好不发布：小红书编辑页会自动存草稿（实测），这里停几秒等自动保存，不点任何按钮
+        await _rand_sleep(5)
+        return "📝 内容已填好，没有点发布（小红书会自动存进草稿箱）"
 
     # ── 点发布（xhs-publish-btn Web Component，closed shadow DOM）──
     # 用调试协议穿透 closed shadow 取"发布"按钮的屏幕坐标（不往页面注入任何代码），再用真实鼠标点
@@ -4837,8 +5272,15 @@ async def _fill_and_publish(page, title: str, content: str, tags: list,
 
 
 @mcp.tool()
-async def delete_note(note_id: str) -> str:
-    """删除指定笔记。note_id 从 get_my_notes 返回的链接中获取（URL 最后一段）。"""
+async def delete_note(note: str) -> str:
+    """删除指定笔记。note 传 get_my_notes 返回的链接或其中的笔记 id。
+
+    示例: delete_note(note="笔记链接或 id")  # 链接/id 来自 get_my_notes
+
+    Args:
+        note: 笔记链接（带 xsec_token 最稳）或 24 位 note_id；只给 id 时 token 自动从缓存补
+    """
+    note_id, _ = _note_id_token(note)
     login_status = await ensure_browser()
     if not login_status:
         return "请先登录小红书账号"
@@ -4860,30 +5302,36 @@ async def delete_note(note_id: str) -> str:
 
         # 卡片上已经没有带 note_id 的链接，id 只在卡片的 data-impression 属性里：
         # 找"最小的、既含该 id 又含删除按钮"的祖先，取它里面删除按钮的坐标
-        target = None
+        card_el = None
         for _ in range(3):
-            target = await page.evaluate("""(nid) => {
+            _h = await page.evaluate_handle("""(nid) => {
                 for (const del of document.querySelectorAll('.note-card__action-btn--del')) {
                     let el = del;
                     for (let i = 0; i < 10 && el; i++, el = el.parentElement) {
                         // 爬到装着多张卡片的容器就停，否则容器必然含 id，会误选别的卡片的按钮
                         if (el.querySelectorAll('.note-card__action-btn--del').length > 1) break;
-                        if (el.outerHTML.includes(nid)) {
-                            el.scrollIntoView({block: 'center'});  // 先滚，再读坐标
-                            const c = el.getBoundingClientRect();
-                            const d = del.getBoundingClientRect();
-                            return {card: [c.left + c.width / 2, c.top + c.height / 2],
-                                    del: [d.left + d.width / 2, d.top + d.height / 2]};
-                        }
+                        if (el.outerHTML.includes(nid)) return el;
                     }
                 }
                 return null;
             }""", note_id)
-            if target:
+            card_el = _h.as_element()
+            if card_el:
                 break
             await _rand_sleep(1.5)
-        if not target:
+        if not card_el:
             return f"找不到笔记 ID {note_id} 对应的卡片，请确认 ID 是否正确"
+
+        # 用真滚轮把卡片滚进视口（原来是页面里 JS scrollIntoView，现在不再有程序化滚动），再读坐标
+        await _wheel_into_view(card_el)
+        await _rand_sleep(0.5)
+        _box = await card_el.bounding_box()
+        _del_el = await card_el.query_selector('.note-card__action-btn--del')
+        _dbox = await _del_el.bounding_box() if _del_el else None
+        if not _box or not _dbox:
+            return "找到卡片但读不到删除按钮坐标（可能不在视口内），未执行删除"
+        target = {'card': [_box['x'] + _box['width'] / 2, _box['y'] + _box['height'] / 2],
+                  'del': [_dbox['x'] + _dbox['width'] / 2, _dbox['y'] + _dbox['height'] / 2]}
 
         # 鼠标移到卡片上（让操作按钮出现）→ 再移到删除按钮点击
         await _human_move(page, target['card'][0], target['card'][1])
@@ -4910,6 +5358,46 @@ async def delete_note(note_id: str) -> str:
         await page.close()
 
 
+async def _open_publish_page():
+    """像真人一样进创作平台：在小红书主站点左侧栏「发布」（a.link-wrapper，target=_blank，
+    href=creator.xiaohongshu.com/publish/publish?source=official），创作服务平台在【新标签页】打开。
+    找不到链接/没开出新标签时，退回新开页面直接访问同一个带 source=official 的网址。"""
+    _pub_url = "https://creator.xiaohongshu.com/publish/publish?source=official"
+    mp = main_page
+    try:
+        if mp is not None and not mp.is_closed():
+            if "www.xiaohongshu.com" not in (mp.url or ""):
+                await mp.goto("https://www.xiaohongshu.com/explore", wait_until="domcontentloaded", timeout=30000)
+                await _rand_sleep(2.5)
+            for attempt in range(2):
+                link = None
+                for el in await mp.query_selector_all('a.link-wrapper[href*="creator.xiaohongshu.com/publish/publish"]'):
+                    try:
+                        if await el.is_visible():
+                            link = el
+                            break
+                    except Exception:
+                        continue
+                if link is not None:
+                    async with mp.context.expect_page(timeout=10000) as pi:
+                        await _human_click(mp, element=link)
+                    newp = await pi.value
+                    newp.set_default_timeout(30000)
+                    try:
+                        await newp.wait_for_load_state("domcontentloaded", timeout=40000)
+                    except Exception:
+                        pass
+                    return newp
+                if attempt == 0:  # 可能被笔记弹层盖住：真人按 Esc 退出
+                    await mp.keyboard.press("Escape")
+                    await _rand_sleep(1)
+    except Exception as e:
+        print(f"[publish] 侧边栏点发布失败，退回直接打开: {str(e)[:100]}", file=sys.stderr, flush=True)
+    page = await browser_context.new_page()
+    await page.goto(_pub_url, wait_until="domcontentloaded", timeout=60000)
+    return page
+
+
 @mcp.tool()
 async def publish_note(
     title: str,
@@ -4918,8 +5406,9 @@ async def publish_note(
     tags: list = [],
     mode: str = "auto",
     card_text: str = "",
+    draft: bool = False,
 ) -> str:
-    """发布小红书图文笔记。
+    """发布小红书图文笔记。draft=True 时只填好内容并点「暂存离开」存草稿，不发布。
 
     Args:
         title: 笔记标题（最多20字）
@@ -4944,20 +5433,16 @@ async def publish_note(
     if mode == "auto":
         mode = "upload" if valid_paths else "text_card"
 
-    page = await browser_context.new_page()
     temp_img = None
+    page = None
 
     try:
-        await page.goto(
-            "https://creator.xiaohongshu.com/publish/publish",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
+        page = await _open_publish_page()
         try:
             await page.wait_for_load_state("networkidle", timeout=10000)
         except Exception:
             pass
-        await _rand_sleep(2)
+        await _rand_sleep(4)  # 真人实录：进创作平台后先看了约 12s 才点第一下；取 2.4–5.6s
 
         if "login" in page.url or "passport" in page.url:
             return "Session 已过期，需要重新登录"
@@ -4996,8 +5481,10 @@ async def publish_note(
             await _rand_sleep(0.8)
 
             # 点"生成图片"
-            if not await _pub_click(page, 'div.edit-text-button'):
-                return "找不到生成图片按钮"
+            if not (await _pub_click(page, 'div.edit-text-button', timeout=4)
+                    or await _pub_click(page, 'button,div,span', '生成图片', timeout=6)):
+                _near = await page.evaluate("() => [...document.querySelectorAll('button,div,span')].filter(e => e.children.length === 0 && /生成|图片|下一步/.test(e.innerText || '')).map(e => e.tagName.toLowerCase() + '.' + (e.className || '') + ':' + e.innerText.trim().slice(0, 12)).slice(0, 15)")
+                return f"找不到生成图片按钮（页面相关元素：{_near}）"
             await _rand_sleep(2)
 
             # 循环点"下一步"，直到标题输入框出现（发布编辑页）
@@ -5089,13 +5576,14 @@ async def publish_note(
 
         # ── 填标题正文标签，点发布 ────────────────────────────────
         return await _fill_and_publish(page, title, content, tags,
-                                       text_card_mode=(mode == "text_card"))
+                                       text_card_mode=(mode == "text_card"), draft=draft)
 
     except Exception as e:
         return f"发布失败：{e}"
     finally:
         await _rand_sleep(2)
-        await page.close()
+        if page is not None:
+            await page.close()
         if temp_img and os.path.exists(temp_img):
             try:
                 os.remove(temp_img)
@@ -5184,7 +5672,15 @@ def _dm_text(msg: dict) -> str:
     except Exception:
         card = {}
     if card.get('title') and card.get('link'):
-        return f"[分享笔记] {card.get('title')}"
+        _m = re.search(r'/(?:explore|discovery/item|item)/([0-9a-f]{24})', str(card.get('link')))
+        _link = str(card.get('link'))
+        _id = f"（note_id: {_m.group(1)}）" if _m else ""
+        # 分享卡片的 link 是 App 协议（xhsdiscover://item/...），带 xsec_token；转成网页链接，可直接传给 get_note_content
+        _tok = re.search(r'xsec_token=([^&]+)', _link)
+        if _m and _tok:
+            _remember_note_token(_m.group(1), _tok.group(1))  # 缓存，之后即使只传 note_id 链接也能补 token
+            _link = f"https://www.xiaohongshu.com/explore/{_m.group(1)}?xsec_token={_tok.group(1)}&xsec_source=app_share"
+        return f"[分享笔记] {card.get('title')} {_id}\n    链接: {_link}"
     return o.get('front_chain') or '[非文字消息]'
 
 
@@ -5245,6 +5741,13 @@ async def _enter_chat(page):
     return chats, my_id
 
 
+def _dm_norm(t: str) -> str:
+    """昵称比对用：NFC 规范化并去掉 emoji 变体选择符/零宽连接符，避免带 emoji 的昵称对不上。"""
+    import unicodedata
+    t = unicodedata.normalize('NFC', t or '')
+    return t.replace('\ufe0f', '').replace('\ufe0e', '').replace('\u200d', '').strip()
+
+
 def _dm_pick(chats: list, user: str):
     """按昵称或 chat_user_id 找会话。返回 (chat, err)。昵称先精确、再唯一子串。"""
     user = (user or '').strip()
@@ -5254,10 +5757,10 @@ def _dm_pick(chats: list, user: str):
     for c in chats:
         if c.get('chat_user_id') == user:
             return c, None
-    exact = [c for c in chats if nm(c) == user]
+    exact = [c for c in chats if nm(c) == user or _dm_norm(nm(c)) == _dm_norm(user)]
     if len(exact) == 1:
         return exact[0], None
-    cand = exact or [c for c in chats if user.lower() in nm(c).lower()]
+    cand = exact or [c for c in chats if _dm_norm(user).lower() in _dm_norm(nm(c)).lower()]
     if len(cand) == 1:
         return cand[0], None
     if not cand:
@@ -5273,7 +5776,7 @@ async def _dm_open_conversation(page, name: str) -> bool:
             nm = await it.evaluate("e => (e.querySelector('.xhs-im-conv-item__name')?.innerText || '').trim()")
         except Exception:
             continue
-        if nm == name:
+        if nm == name or _dm_norm(nm) == _dm_norm(name):
             target = it
             break
     if target is None:
@@ -5287,9 +5790,14 @@ async def get_chats(limit: int = 20) -> str:
     """查看私信会话列表（对方昵称、最后一条消息、时间）。只看列表，不会点开会话，所以不会把任何消息标成已读。
     网页版私信只能操作已有会话。
 
+    示例: get_chats(limit=10)  # 先看列表拿 chat_user_id，再用 read_chat
+
     Args:
         limit: 最多返回多少个会话，默认 20（按最近消息时间排序）
     """
+    _rg = _read_gate()
+    if _rg:
+        return _rg
     _b = _RateLimit.breaker_message()
     if _b:
         return _b
@@ -5326,10 +5834,15 @@ async def read_chat(user: str, limit: int = 20) -> str:
     """读和某人的私信聊天记录（最近 N 条，按时间正序）。
     ⚠️ 会点开会话，页面会自动把该会话标成已读，对方那边会显示"已读"。只想看有哪些会话用 get_chats。
 
+    示例: read_chat(user="昵称或 chat_user_id", limit=5)
+
     Args:
         user: 对方昵称，或 get_chats 里给的 chat_user_id
         limit: 最多返回多少条，默认 20（单次最多 30 条，是页面一次加载的量）
     """
+    _rg = _read_gate()
+    if _rg:
+        return _rg
     _b = _RateLimit.breaker_message()
     if _b:
         return _b
