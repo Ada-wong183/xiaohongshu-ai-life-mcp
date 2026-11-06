@@ -2526,7 +2526,10 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
 _VIDEO_MAX_SECS = 1800       # 超过 30 分钟不自动分析，只给元信息
 _VIDEO_MAX_BYTES = 300 * 1024 * 1024
 _QWEN_BASE = "https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1"
-_QWEN_MODEL = "qwen3.8-omni-flash"
+_QWEN_MODEL = os.environ.get("XHS_QWEN_MODEL", "qwen3.8-omni-flash")
+# 千问"思考模式"：默认关（实测 24s/约 3 分钱）；XHS_VIDEO_THINKING=1 打开（实测 109s/约 5 分钱，思考过程占输出的 90%）
+_VIDEO_THINKING = os.environ.get("XHS_VIDEO_THINKING", "0").strip().lower() in ("1", "true", "yes", "on")
+_QWEN_READ_TIMEOUT = 420 if _VIDEO_THINKING else 240
 _GEMINI_VIDEO_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"]
 _VIDEO_PROMPT = (
     "请用中文分析这个视频：\n"
@@ -2570,20 +2573,20 @@ def _sorted_streams(info):
     st.sort(key=lambda x: x.get("size") or 1 << 60)   # 最小的先（只为理解内容，不要高清）
     return st
 
-def _qwen_video_sync(url, timeout=240):
+def _qwen_video_sync(url, timeout=None):
     """千问 Omni：把视频链接直接交给它（它自己去拉），关掉思考模式（否则慢 4 倍、贵 2 倍）。返回 (文字, 用量dict)。"""
     key = _load_dashscope_key()
     if not key:
         raise RuntimeError("未配置 DASHSCOPE_API_KEY（环境变量或同目录 .env）")
     body = {
         "model": _QWEN_MODEL, "modalities": ["text"], "stream": True,
-        "stream_options": {"include_usage": True}, "enable_thinking": False,
+        "stream_options": {"include_usage": True}, "enable_thinking": _VIDEO_THINKING,
         "messages": [{"role": "user", "content": [
             {"type": "video_url", "video_url": {"url": url}},
             {"type": "text", "text": _VIDEO_PROMPT}]}],
     }
     out, usage = [], {}
-    with requests.post(_QWEN_BASE + "/chat/completions", json=body, stream=True, timeout=(15, timeout),
+    with requests.post(_QWEN_BASE + "/chat/completions", json=body, stream=True, timeout=(15, timeout or _QWEN_READ_TIMEOUT),
                        headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}) as r:
         if r.status_code != 200:
             raise RuntimeError(f"千问 HTTP {r.status_code}: {r.text[:300]}")
@@ -2702,7 +2705,7 @@ async def _process_video_note(page, info, title="", include_frames=False):
     # 1) 千问：直接给链接（不下载、不转码）
     try:
         analysis, usage = await asyncio.wait_for(
-            loop.run_in_executor(None, _qwen_video_sync, streams[0]["url"]), timeout=300)
+            loop.run_in_executor(None, _qwen_video_sync, streams[0]["url"]), timeout=_QWEN_READ_TIMEOUT + 30)
         who = f"千问 {_QWEN_MODEL}（输入 {usage.get('prompt_tokens', '?')} / 输出 {usage.get('completion_tokens', '?')} tokens）"
     except Exception as e:
         errs.append(f"千问失败：{str(e)[:200]}")
