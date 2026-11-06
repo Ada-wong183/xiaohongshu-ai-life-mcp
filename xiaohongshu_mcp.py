@@ -2674,6 +2674,40 @@ def _gemini_video_sync(path):
                 _t.sleep(4 * (attempt + 1))
     raise RuntimeError("Gemini 全部失败：" + last)
 
+def _gemini_video_url_sync(url):
+    """Gemini 兜底第一步：直接把视频链接当文件交给 Gemini（它自己去拉，不下载不转码）。遇 503 等瞬时错误重试。
+    返回 (文字, 模型名)；http 链接不行时换 https 再试一次。"""
+    import time as _t
+    from google import genai
+    from google.genai import types
+    key = _load_gemini_key()
+    if not key:
+        raise RuntimeError("未配置 GEMINI_API_KEY")
+    c = genai.Client(api_key=key)
+    urls = [url] + ([url.replace("http://", "https://", 1)] if url.startswith("http://") else [])
+    last = ""
+    for u in urls:
+        url_dead = False
+        for model in _GEMINI_VIDEO_MODELS:
+            for attempt in range(3):
+                try:
+                    r = c.models.generate_content(model=model, contents=[
+                        types.Part(file_data=types.FileData(file_uri=u, mime_type="video/mp4")), _VIDEO_PROMPT])
+                    if r.text:
+                        return r.text.strip(), model
+                except Exception as e:
+                    last = f"{model}: {str(e)[:160]}"
+                    if "models/" in last and ("no longer available" in last or "not found for API" in last):
+                        break   # 模型名下线：换下一个模型
+                    # 链接本身拉不到/不被接受（跟模型忙不忙无关）：别重试、别换模型，直接换下一种链接或交给下一级兜底
+                    if any(k in last for k in ("Cannot fetch", "NOT_FOUND", "INVALID_ARGUMENT", "PERMISSION_DENIED", " 400", " 403", " 404")):
+                        url_dead = True
+                        break
+                    _t.sleep(3 * (attempt + 1))   # 503/429 等瞬时错误：退避重试
+            if url_dead:
+                break
+    raise RuntimeError("Gemini 直传链接失败：" + last)
+
 def _extract_frames_sync(path, duration, n=5):
     """ffmpeg 均匀抽 n 张关键帧（640 宽），返回路径列表。"""
     import subprocess
@@ -2709,7 +2743,15 @@ async def _process_video_note(page, info, title="", include_frames=False):
         who = f"千问 {_QWEN_MODEL}（输入 {usage.get('prompt_tokens', '?')} / 输出 {usage.get('completion_tokens', '?')} tokens）"
     except Exception as e:
         errs.append(f"千问失败：{str(e)[:200]}")
-    # 2)（需要时）下载到本地：Gemini 兜底 / 抽帧
+    # 2) Gemini：同样直接给链接（不下载、不转码）
+    if not analysis:
+        try:
+            analysis, model = await asyncio.wait_for(
+                loop.run_in_executor(None, _gemini_video_url_sync, streams[0]["url"]), timeout=240)
+            who = f"Gemini {model}（千问不可用时的兜底，直传链接）"
+        except Exception as e:
+            errs.append(f"Gemini 直传链接失败：{str(e)[:200]}")
+    # 3)（需要时）下载到本地：Gemini 上传兜底 / 抽帧
     path = ""
     vdir = ""
     if (not analysis) or include_frames:
@@ -2717,7 +2759,7 @@ async def _process_video_note(page, info, title="", include_frames=False):
         path, derr = await loop.run_in_executor(None, _download_video_sync, info, vdir)
         if not path:
             errs.append(f"视频下载失败：{derr}")
-    if not analysis and path:
+    if not analysis and path:   # 4) Gemini 上传兜底（转 480p 再上传）
         try:
             analysis, model = await asyncio.wait_for(
                 loop.run_in_executor(None, _gemini_video_sync, path), timeout=420)
