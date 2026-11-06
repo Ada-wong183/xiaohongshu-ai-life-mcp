@@ -27,6 +27,7 @@
 | 💬 **站内回复** | 回复评论走"点侧栏通知入口 → 在通知页直接回"，和真人路径一致，找不到才退回笔记页 |
 | 📝 **能发笔记** | 本地图片、小红书内置文字配图、本地生成图片三种模式，话题标签自动选 |
 | 🛡️ **风控熔断** | 持久化限速 + 验证码/频繁提示检测，命中即暂停所有操作，重启不清零 |
+| 🎬 **视频笔记自动识别** | 按页面里的 `note.type` 自动分流：图文照常读，视频笔记交给多模态模型（默认通义千问 Omni，失败退 Gemini）转写口播 + 概括画面，不用你提前告诉 AI 是图文还是视频 |
 | 🌿 **闲逛养号** | 后台偶尔刷刷首页、点开看看，不点赞不评论，有正事立刻让路 |
 
 ## 🏗️ 工作方式
@@ -102,7 +103,8 @@ Claude Code 的 `~/.claude.json` 里加入：
 
 | 变量 | 说明 |
 |------|------|
-| `GEMINI_API_KEY` | 笔记配图超过 4 张时，用 Gemini 分析图片内容。[免费申请](https://aistudio.google.com/apikey) |
+| `DASHSCOPE_API_KEY` | 视频笔记的首选分析模型（通义千问 `qwen3.8-omni-flash`，国内直连，按量计费，一条 1 分钟左右的视频约几分钱）。没配就直接走 Gemini 兜底 |
+| `GEMINI_API_KEY` | 笔记配图超过 4 张时分析图片；也是视频笔记的兜底模型（千问失败时用）。[免费申请](https://aistudio.google.com/apikey) |
 | `XHS_MY_NICK` | 自己的昵称，通知里被回复的评论是自己的就显示"我" |
 | `XHS_PRIORITY_USERS` | 关联号 user_id 或昵称，逗号分隔，它们的评论/@ 会立刻唤醒 |
 | `XHS_WATCH` | `0` 关闭看门狗 |
@@ -132,7 +134,7 @@ Claude Code 的 `~/.claude.json` 里加入：
 |------|------|------|
 | `search_notes` | `keywords`, `limit=20`, `verbose=False` | 关键词搜索笔记 |
 | `list_feeds` | `limit=20`, `verbose=False` | 首页推荐信息流 |
-| `get_note_content` | `note`, `include_images=True`, `include_comments=True` | 笔记正文 + 前 15 条评论（`include_comments=False` 只取正文）；≤4 张图返回本地路径，>4 张用 Gemini 分析。链接缺 `xsec_token` 时自动用缓存补 |
+| `get_note_content` | `note`, `include_images=True`, `include_comments=True`, `include_video_frames=False` | 笔记正文 + 前 15 条评论（`include_comments=False` 只取正文）；**视频笔记自动识别**并返回口播转写 + 画面概括（`include_video_frames=True` 额外附 5 张关键帧）；≤4 张图返回本地路径，>4 张用 Gemini 分析。链接缺 `xsec_token` 时自动用缓存补 |
 | `get_note_comments` | `note`, `limit=0` | 评论列表（含楼中楼展开）；`limit` 只截断输出的一级评论条数；头部会写"页面共 N 条，读到 M 条"，漏读一目了然 |
 | `get_note_images` | `note` | 只取图片，不含正文 |
 | `get_notifications` | `tab="comments"`, `limit=20`, `only_unreplied=False`, `verbose=False` | 评论@ / 赞和收藏 / 新增关注；自动对照回复记录标"已回复" |
@@ -235,6 +237,12 @@ rm -f browser_data/SingletonLock browser_data/SingletonCookie
 **打开笔记提示"暂时无法浏览"**
 
 小红书打开笔记需要 `xsec_token`。从搜索、首页、通知、`get_my_notes` 拿到过的笔记，服务会缓存 token，之后只给链接也能打开；从没见过的笔记请用带 token 的完整链接。
+
+**视频笔记怎么读？准不准？**
+
+`get_note_content` 发现 `note.type == "video"` 后，取页面里最小的那条视频流的签名链接，直接交给千问 Omni（它自己去拉，不用下载、不用转码；务必关掉思考模式，否则慢 4 倍、贵 2 倍，代码里已关）。千问失败时退到 Gemini（下载 → ffmpeg 转 480p → 上传，遇 503 自动重试），再失败只给关键帧。需要本机有 `ffmpeg`（只有 Gemini 兜底和抽帧会用到）。
+
+转写大意可信，但**说话人归属和时间戳不太可靠**，模型偶尔会脑补动作，细节别当原文引用。
 
 **小红书改版后功能失效**
 

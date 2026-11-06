@@ -2522,8 +2522,225 @@ async def search_notes(keywords: str, limit: int = 20, verbose: bool = False) ->
     except Exception as e:
         return f"搜索笔记时出错: {str(e)}"
 
+# ── 视频笔记：note.type 分流 → 千问 Omni（链接直传）→ Gemini 兜底 → 只给关键帧 ──────
+_VIDEO_MAX_SECS = 1800       # 超过 30 分钟不自动分析，只给元信息
+_VIDEO_MAX_BYTES = 300 * 1024 * 1024
+_QWEN_BASE = "https://cn-beijing.maas.qianwenaiapi.com/compatible-mode/v1"
+_QWEN_MODEL = "qwen3.8-omni-flash"
+_GEMINI_VIDEO_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"]
+_VIDEO_PROMPT = (
+    "请用中文分析这个视频：\n"
+    "1) 逐句转写视频里的说话内容，带大致时间戳；说话人用自然的称呼区分（如“男子”“画外音”“女声”），不要用 A/B；"
+    "没有人说话就写“无口播”，有字幕/屏幕文字也一并写出。\n"
+    "2) 用一小段话概括画面内容和整体想表达的意思。\n"
+    "只写你确实看到/听到的，听不清的标注“听不清”，不要编造。"
+)
+
+def _load_dashscope_key() -> str:
+    """读 DASHSCOPE_API_KEY（环境变量，或同目录 .env 里的 KEY=VALUE；不进代码、不进日志）"""
+    return os.environ.get("DASHSCOPE_API_KEY", "").strip()
+
+async def _get_video_info(page):
+    """从 __INITIAL_STATE__ 读笔记类型；视频笔记返回 {type, duration, streams}，图文返回 {type:'normal'}。"""
+    return await page.evaluate("""() => {
+        try {
+            const st = window.__INITIAL_STATE__;
+            const map = (st && st.note && st.note.noteDetailMap) || {};
+            const cur = st && st.note && st.note.currentNoteId;
+            const cur_id = (cur && (cur.value !== undefined ? cur.value : cur)) || "";
+            const item = map[cur_id] || Object.values(map)[0];
+            const n = item && (item.note || item);
+            if (!n) return {type: ""};
+            const out = {type: n.type || "normal", duration: 0, streams: []};
+            const v = n.video;
+            if (out.type === "video" && v) {
+                out.duration = (v.capa && v.capa.duration) || 0;
+                const s = (v.media && v.media.stream) || {};
+                for (const k of Object.keys(s))
+                    for (const x of (s[k] || []))
+                        out.streams.push({url: x.masterUrl || "", backup: x.backupUrls || [], size: x.size || 0,
+                                          w: x.width || 0, h: x.height || 0, codec: x.videoCodec || "", dur: x.duration || 0});
+            }
+            return out;
+        } catch (e) { return {type: "", err: String(e)}; }
+    }""")
+
+def _sorted_streams(info):
+    st = [x for x in info.get("streams", []) if x.get("url")]
+    st.sort(key=lambda x: x.get("size") or 1 << 60)   # 最小的先（只为理解内容，不要高清）
+    return st
+
+def _qwen_video_sync(url, timeout=240):
+    """千问 Omni：把视频链接直接交给它（它自己去拉），关掉思考模式（否则慢 4 倍、贵 2 倍）。返回 (文字, 用量dict)。"""
+    key = _load_dashscope_key()
+    if not key:
+        raise RuntimeError("未配置 DASHSCOPE_API_KEY（环境变量或同目录 .env）")
+    body = {
+        "model": _QWEN_MODEL, "modalities": ["text"], "stream": True,
+        "stream_options": {"include_usage": True}, "enable_thinking": False,
+        "messages": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": url}},
+            {"type": "text", "text": _VIDEO_PROMPT}]}],
+    }
+    out, usage = [], {}
+    with requests.post(_QWEN_BASE + "/chat/completions", json=body, stream=True, timeout=(15, timeout),
+                       headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}) as r:
+        if r.status_code != 200:
+            raise RuntimeError(f"千问 HTTP {r.status_code}: {r.text[:300]}")
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw or not raw.startswith("data:"):
+                continue
+            d = raw[5:].strip()
+            if d == "[DONE]":
+                break
+            try:
+                j = json.loads(d)
+            except Exception:
+                continue
+            if j.get("error"):
+                raise RuntimeError(f"千问报错: {str(j['error'])[:300]}")
+            for ch in j.get("choices") or []:
+                t = (ch.get("delta") or {}).get("content")
+                if t:
+                    out.append(t)
+            if j.get("usage"):
+                usage = j["usage"]
+    text = "".join(out).strip()
+    if not text:
+        raise RuntimeError("千问返回为空")
+    return text, usage
+
+def _download_video_sync(info, save_dir):
+    """下载最小的流到本地（Gemini 兜底、抽帧用）。签名链接不需要登录态；主链失败换备用链接。"""
+    last_err = "页面里没找到视频地址"
+    for st in _sorted_streams(info):
+        if st.get("size", 0) > _VIDEO_MAX_BYTES:
+            last_err = "视频文件过大"
+            continue
+        for u in [st["url"]] + list(st.get("backup") or []):
+            try:
+                path = os.path.join(save_dir, "video.mp4")
+                with requests.get(u, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.xiaohongshu.com/"},
+                                  stream=True, timeout=30) as r:
+                    if r.status_code != 200:
+                        last_err = f"HTTP {r.status_code}"
+                        continue
+                    n = 0
+                    with open(path, "wb") as f:
+                        for chunk in r.iter_content(1 << 16):
+                            n += len(chunk)
+                            if n > _VIDEO_MAX_BYTES:
+                                raise RuntimeError("视频超过大小上限")
+                            f.write(chunk)
+                if n > 0:
+                    return path, ""
+            except Exception as e:
+                last_err = str(e)
+    return None, last_err
+
+def _gemini_video_sync(path):
+    """Gemini 兜底：转 480p H.264 再上传（小、快、稳）；遇到 503 等瞬时错误重试。返回 (文字, 模型名)。"""
+    import subprocess, time as _t
+    from google import genai
+    key = _load_gemini_key()
+    if not key:
+        raise RuntimeError("未配置 GEMINI_API_KEY")
+    small = os.path.join(os.path.dirname(path), "small.mp4")
+    try:
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", path, "-vf", "scale=-2:480", "-c:v", "libx264",
+                        "-preset", "veryfast", "-crf", "28", "-c:a", "aac", "-b:a", "64k", small],
+                       check=True, timeout=300)
+        up_path = small
+    except Exception:
+        up_path = path
+    c = genai.Client(api_key=key)
+    f = c.files.upload(file=up_path)
+    t0 = _t.time()
+    while str(f.state).endswith("PROCESSING") and _t.time() - t0 < 120:
+        _t.sleep(3)
+        f = c.files.get(name=f.name)
+    last = ""
+    for model in _GEMINI_VIDEO_MODELS:
+        for attempt in range(3):
+            try:
+                r = c.models.generate_content(model=model, contents=[f, _VIDEO_PROMPT])
+                if r.text:
+                    return r.text.strip(), model
+            except Exception as e:
+                last = f"{model}: {str(e)[:160]}"
+                _t.sleep(4 * (attempt + 1))
+    raise RuntimeError("Gemini 全部失败：" + last)
+
+def _extract_frames_sync(path, duration, n=5):
+    """ffmpeg 均匀抽 n 张关键帧（640 宽），返回路径列表。"""
+    import subprocess
+    fdir = tempfile.mkdtemp(prefix="xhs_vframes_")
+    dur = float(duration or 0) or 30.0
+    out = []
+    for i in range(n):
+        ts = dur * (i + 0.5) / n
+        fp = os.path.join(fdir, f"frame_{i+1:02d}.jpg")
+        try:
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{ts:.2f}", "-i", path, "-frames:v", "1",
+                            "-vf", "scale=640:-2", fp], check=True, timeout=60)
+            if os.path.exists(fp):
+                out.append(fp)
+        except Exception:
+            pass
+    return out
+
+async def _process_video_note(page, info, title="", include_frames=False):
+    """视频笔记：千问链接直传 → Gemini 兜底 → 只给关键帧。返回 (文字块, 帧路径列表)。"""
+    dur = info.get("duration") or 0
+    if dur and dur > _VIDEO_MAX_SECS:
+        return (f"\n\n🎬 这是视频笔记，时长 {dur} 秒（超过 {_VIDEO_MAX_SECS} 秒上限，未自动分析）。"), []
+    streams = _sorted_streams(info)
+    if not streams:
+        return "\n\n🎬 这是视频笔记，但页面里没找到视频地址。", []
+    loop = asyncio.get_running_loop()
+    errs, analysis, who = [], "", ""
+    # 1) 千问：直接给链接（不下载、不转码）
+    try:
+        analysis, usage = await asyncio.wait_for(
+            loop.run_in_executor(None, _qwen_video_sync, streams[0]["url"]), timeout=300)
+        who = f"千问 {_QWEN_MODEL}（输入 {usage.get('prompt_tokens', '?')} / 输出 {usage.get('completion_tokens', '?')} tokens）"
+    except Exception as e:
+        errs.append(f"千问失败：{str(e)[:200]}")
+    # 2)（需要时）下载到本地：Gemini 兜底 / 抽帧
+    path = ""
+    vdir = ""
+    if (not analysis) or include_frames:
+        vdir = tempfile.mkdtemp(prefix="xhs_video_")
+        path, derr = await loop.run_in_executor(None, _download_video_sync, info, vdir)
+        if not path:
+            errs.append(f"视频下载失败：{derr}")
+    if not analysis and path:
+        try:
+            analysis, model = await asyncio.wait_for(
+                loop.run_in_executor(None, _gemini_video_sync, path), timeout=420)
+            who = f"Gemini {model}（千问不可用时的兜底）"
+        except Exception as e:
+            errs.append(f"Gemini 失败：{str(e)[:200]}")
+    frames = []
+    if path and (include_frames or not analysis):
+        try:
+            frames = await loop.run_in_executor(None, _extract_frames_sync, path, dur, 5 if analysis else 6)
+        except Exception as e:
+            errs.append(f"抽帧失败：{e}")
+    head = f"\n\n🎬 视频笔记（{dur} 秒）"
+    if analysis:
+        out = f"{head}，内容如下（听写+画面，可能有错字、说话人对不上，仅供理解大意）：\n{analysis}"
+    else:
+        out = f"{head}，自动分析失败：" + "；".join(errs) + (
+            "。已附关键帧，只能靠画面理解。" if frames else "。")
+    if analysis and errs:
+        out += "\n（备注：" + "；".join(errs) + "）"
+    if frames:
+        out += f"\n🖼 关键帧 {len(frames)} 张已随结果以图片附上。"
+    return out, frames
+
 @mcp.tool()
-async def get_note_content(note: str, include_images: bool = True, include_comments: bool = True) -> Any:
+async def get_note_content(note: str, include_images: bool = True, include_comments: bool = True, include_video_frames: bool = False) -> Any:
     """获取笔记正文、配图和前15条评论，一次调用返回完整内容。有笔记链接时首选此工具，不要用 search_notes 代替。
     支持完整链接（xiaohongshu.com/explore/...）和短链（xhslink.cn/...）。
     如需获取更多评论，再单独调用 get_note_comments。
@@ -2536,6 +2753,8 @@ async def get_note_content(note: str, include_images: bool = True, include_comme
             ≤4张：下载到本地，返回路径供 AI 直接读取图片内容；
             >4张：调用 Gemini 3.6 Flash 分析图片，返回文字描述。
         include_comments: 是否顺带返回前15条评论（默认 True）。只想看正文、不需要评论时传 False。
+        include_video_frames: 视频笔记是否额外抽 5 张关键帧附上（默认 False，会多下载一次视频、多花十几秒）。
+            视频笔记会自动识别（note.type=video）：千问 Omni 直接读链接，转写口播+概括画面；失败退回 Gemini；再失败只给关键帧。
     """
     url = _note_url(note)
     _rg = _read_gate()
@@ -3081,8 +3300,25 @@ async def get_note_content(note: str, include_images: bool = True, include_comme
         result += f"链接: {url}\n\n"
         result += f"内容:\n{post_content['内容']}"
 
+        # ── 视频分流：note.type == "video" 走视频分支，图文走原流程 ──────
+        _is_video = False
+        try:
+            _vinfo = await _get_video_info(main_page)
+            _is_video = (_vinfo.get("type") == "video")
+        except Exception as e:
+            print(f"读取笔记类型出错: {e}")
+        if _is_video and include_images:
+            try:
+                _vtext, _vframes = await _process_video_note(main_page, _vinfo, post_content.get('标题', ''), include_frames=include_video_frames)
+                result += _vtext
+                _attach_paths = list(_vframes)
+            except Exception as e:
+                result += f"\n\n（视频处理出错：{e}）"
+            include_images_effective = False
+        else:
+            include_images_effective = include_images
         # ── 配图处理 ──────────────────────────────────────────────
-        if include_images:
+        if include_images_effective:
             try:
                 # 从页面抓图片 URL
                 img_urls = await main_page.evaluate("""() => {
@@ -3794,7 +4030,9 @@ async def get_note_images(note: str) -> Any:
             return {
                 "title": title, "author": author, "desc": desc,
                 "image_count": 0, "image_paths": [],
-                "message": "该笔记没有图片（可能是纯文字或视频笔记）"
+                "message": ("这是视频笔记，不是图文——请改用 get_note_content（会自动下载视频、抽帧并转写）"
+                            if (await _get_video_info(main_page)).get("type") == "video"
+                            else "该笔记没有图片（可能是纯文字笔记）")
             }
 
         # 用已登录的真 Chrome 下载（不再用 requests 单独拉 CDN）
